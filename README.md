@@ -11,7 +11,7 @@ $ pip3 install numpy scipy
 ```
 - PCL: I recommend installing via a conda environment
 ```
-$ conda create pcl_env
+$ conda create -n pcl_env
 $ conda activate pcl_env
 (pcl_env) $ conda install -c sirokujira pcl --channel conda-forge
 (pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge
