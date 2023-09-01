@@ -29,6 +29,7 @@ import importlib
 import sys
 import subprocess
 import re
+from configparser import ConfigParser
 
 def check_and_install_module(module_name):
     try:
@@ -246,6 +247,7 @@ def generate_tunnel_points(target, point_protein_distance, pclfile, ignore_res):
 
 
 def cluster_tunnel_points(target, pclfile):
+    print('Using pcl clustering method')
     # run pcl to cluster the points
     noerr = subprocess.run(f"conda run -n pcl_env python -c '\
 import json\n\
@@ -276,6 +278,54 @@ with open(\"{PWD()}{os.path.sep}point_clusters.json\", \"w\") as file:\n\
     DelObj(f'TunnelPoints')
     w('Finished clustering.')
 
+def cluster_tunnel_points_nopcl(target, ball_spacing, pc_object='TunnelPoints'):
+    print('Using Yasara clustering method')
+    counter = 1
+    while True:
+        if counter > 1:
+            chk = ListObj(pc_object)
+            if chk == []:
+                break
+        try:
+            cur = ListAtom('obj ' + str(pc_object))
+        except RuntimeError:
+            ShowMessage('No tunnels found')
+            plugin.end()
+        SelectAtom(cur[0])
+        org = 0
+        while True:
+            new_atms = ListAtom(f'obj {pc_object} atom !selected with distance < {(ball_spacing / 2) + ball_spacing} from obj {pc_object} atom selected', format="ATOMNUM")
+            SelectAtom(" ".join([str(x) for x in new_atms]), mode="add")
+            org = org + len(new_atms)
+            if len(new_atms) == 0:
+                c = DuplicateAtom('Selected')[0]
+                NameObj(c, f"{target}Clu{CountAtom(f'obj {c}'):06d}")
+                counter += 1
+                DelAtom('obj ' + str(pc_object) + ' atom selected')
+                UnselectAll()
+                break
+
+    org_obj_nums = ListObj(f'{target}Clu??????', format='OBJNUM')
+    free_obj_num = max(ListObj('All', format='OBJNUM')) + 1
+    RenumberObj(f'{target}Clu??????', free_obj_num)
+
+    obj_names = ListObj(f'{target}Clu??????', format='OBJNAME')
+    obj_nums = ListObj(f'{target}Clu??????', format='OBJNUM')
+    obj_nums_sorted = [x for _, x in reversed(sorted(zip(obj_names, obj_nums)))]
+
+    for i, obj in enumerate(obj_nums_sorted):
+        ColorObj (obj, (i +1) * 25)
+        RenumberObj(obj, org_obj_nums[i])
+    
+    for obj in ListObj(f'{target}Clu??????', format='OBJNUM'):
+        new = DuplicateRes(f'obj {target} res protein with distance < 4 from obj {obj}')
+        NameObj(new, NameObj(obj)[0] + 'A')
+
+    RenumberObj(f'{target} {target}excluded {target}Close2Prot {target}Close2Surf', target)
+    RenumberObj(f'{target} {target}excluded {target}Close2Prot {target}Close2Surf {target}Clu???????', target)
+    DelObj(f'TunnelPoints')
+    w('Finished clustering.')
+
 Console("off")
 
 if request == 'Tunneler':
@@ -300,6 +350,12 @@ if request == 'Tunneler':
             ShowMessage("Some python modules are missing, try installing manually. Exiting.")
             plugin.end()
 
+    # check previously saved parameters
+    if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tunneler.ini')):
+        print('found prev. settings')
+        settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tunneler.ini')
+    else:
+        print('no sets')
     # Ask user input for parameters
     ignore_surface, ball_spacing, max_ball_protein, keep_prot_points, surf_con_prev, keep_surf_points, mds, min_vol, use_all_res, build_pol, prog =\
         ShowWin("Custom","Step 2: Tunnel analysis parameters",600,380,
@@ -320,6 +376,35 @@ if request == 'Tunneler':
                                     20, 300,  "Show progress",
                                     20, 340,  "Debug",
                 "Button",              540, 340, "_O_K")
+    
+
+
+    # Example variables
+    variables = {
+        'ignore_surface':ignore_surface,
+        'ball_spacing':ball_spacing,
+        'max_ball_protein':max_ball_protein,
+        'keep_prot_points':keep_prot_points,
+        'surf_con_prev':surf_con_prev,
+        'keep_surf_points':keep_surf_points,
+        'mds':mds,
+        'min_vol':min_vol,
+        'use_all_res':use_all_res,
+        'build_pol':build_pol,
+        'prog':prog
+    }
+    config = ConfigParser()
+
+    # Add the variables to the ConfigParser object
+    config['Variables'] = {}
+    for name, value in variables.items():
+        config['Variables'][name] = str(value)
+
+    # Save the variables to an INI file
+    with open('config.ini', 'w') as configfile:
+        config.write(configfile)
+
+    print("Variables saved to config.ini")
 
     target = [selection[0].object[j].number.inyas for j in range(selection[0].objects)][0]
     target_name = NameObj(target)[0]
@@ -352,18 +437,25 @@ if request == 'Tunneler':
 
     s_start_time = time.perf_counter()
     conda_test = subprocess.run(f"conda run -n pcl_env python -c 'import importlib.util; check = importlib.util.find_spec(\"pcl\"); print(check)'",shell=True, capture_output=True, text=True)
+    use_pcl = True
+
     if conda_test.stderr != '':
         if 'command not found' in conda_test.stderr:
-            ShowMessage('Error: `conda` wasn\'t found on the system.')
+            ShowMessage('Error: `conda` wasn\'t found on the system. Using (slow) Yasara clustering')
         elif 'EnvironmentLocationNotFound' in conda_test.stderr:
-            ShowMessage('Error: `conda` found, but environment pcl_env doesn\t exist.')
+            ShowMessage('Error: `conda` found, but environment pcl_env doesn\t exist. Using (slow) Yasara clustering')
+        else:
+            ShowMessage('Error: the plugin was unsuccessful in running conda. Check the console. Using (slow) Yasara clustering')
+            print(conda_test.stderr)
         print('To install pcl, install (Ana/mini)conda and do:\n$ conda create pcl_env\n$ conda activate pcl_env\n(pcl_env) $ conda install -c sirokujira pcl --channel conda-forge\n(pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge')
-        plugin.end()
+        use_pcl = False
     else:
         if conda_test.stdout == 'None\n\n':
-            ShowMessage('Error: `conda` works and pcl_env exists, but pcl and/or python-pcl wasn\'t installed.')
+            ShowMessage('Warning: `conda` works and pcl_env exists, but pcl and/or python-pcl wasn\'t installed. Using (slow) Yasara clustering')
+            Wait(20)
             print('To install pcl, install (Ana/mini)conda and do:\n$ conda create pcl_env\n$ conda activate pcl_env\n(pcl_env) $ conda install -c sirokujira pcl --channel conda-forge\n(pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge')
-            plugin.end()
+            # plugin.end()
+            use_pcl = False
  
     Print(f'software check v2 took {"{:.6f}".format(time.perf_counter()  - s_start_time)} seconds')
 
@@ -443,7 +535,10 @@ if request == 'Tunneler':
                 AddObj('All')
                 SwitchObj(f'MD?_{target_name}', 'OFF')
 
-    cluster_tunnel_points(target, pclfile='points_to_cluster.npy')
+    if use_pcl:
+        cluster_tunnel_points(target, pclfile='points_to_cluster.npy')
+    else:
+        cluster_tunnel_points_nopcl(target, ball_spacing, pc_object='TunnelPoints')
 
     CenterAtom('All')
     BallStickAll()
@@ -477,10 +572,12 @@ if request == 'Tunneler':
 
         ShowButton("Tunnel on/off",x='12%', y='55%',color="White", height=40)
         ShowButton("Target on/off",x='12%', y='60%',color="White", height=40)
-        ShowButton("Surface on/off",x='12%', y='65%',color="White", height=40)
+        ShowButton("Surf",x='3%', y='65%',color="White", height=40)
+        ShowButton("SecStr",x='9%', y='65%',color="White", height=40)
+        ShowButton("Nonprot",x='17%', y='65%',color="White", height=40)
         ShowButton("Color by tunnel/dist",x='12%', y='70%',color="White", height=40)
         ShowButton("Spheres",x='5%', y='75%',color="White", height=40)
-        ShowButton("Balls",x='123', y='75%',color="White", height=40)
+        ShowButton("Balls",x='12%', y='75%',color="White", height=40)
         ShowButton("Points",x='18%', y='75%',color="White", height=40)
         ShowButton("Remove inside points",x='12%', y='80%',color="White", height=40)
         ShowButton("Exit",x='12%', y='85%',color="Red", height=40)
@@ -503,7 +600,7 @@ elif request == 'Targetonoff':
     else:
         SwitchObj(target, 'OFF')
 
-elif request == 'Surfaceonoff':
+elif request == 'Surf':
     current = SwitchObj('1Surf')[0]
     if current == 'Off':
         SwitchObj('1Surf', 'ON')
