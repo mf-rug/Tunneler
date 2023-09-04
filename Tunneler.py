@@ -173,7 +173,6 @@ def point_cloud(target, ignore_surface, keep_surf_points, surf_con_prev, build_p
         
         # Convert structured array to a regular array
         outer_points = non_common_rows.view(shape_points.dtype).reshape(-1, ncols)
-        # outer_points = shape_points
         shape_points = shape_points2
 
 
@@ -249,7 +248,7 @@ def generate_tunnel_points(target, point_protein_distance, pclfile, ignore_res):
 def cluster_tunnel_points(target, pclfile):
     print('Using pcl clustering method')
     # run pcl to cluster the points
-    noerr = subprocess.run(f"conda run -n pcl_env python -c '\
+    noerr = subprocess.run(f"conda run -n pcl_env python -c \"\
 import json\n\
 import pcl\n\
 from numpy import load, float32\n\
@@ -260,7 +259,7 @@ ec = cloud.make_EuclideanClusterExtraction()\n\
 ec.set_ClusterTolerance(1.01 * {ball_spacing})\n\
 ec.set_MinClusterSize({min_vol / ball_spacing})\n\
 with open(\"{PWD()}{os.path.sep}point_clusters.json\", \"w\") as file:\n\
-    json.dump(ec.Extract(), file)'", 
+    json.dump(ec.Extract(), file)\"", 
     shell=True, capture_output=True, text=True)
     with open(f'{PWD()}{os.path.sep}point_clusters.json', 'r') as file:
         sorted_cluster_indices = json.load(file)
@@ -436,22 +435,22 @@ if request == 'Tunneler':
     # Print(f'software check took {"{:.6f}".format(time.perf_counter()  - s_start_time)} seconds')
 
     s_start_time = time.perf_counter()
-    conda_test = subprocess.run(f"conda run -n pcl_env python -c 'import importlib.util; check = importlib.util.find_spec(\"pcl\"); print(check)'",shell=True, capture_output=True, text=True)
+    conda_test = subprocess.run(f"conda run -n pcl_env python -c \"import importlib.util; check = importlib.util.find_spec(\"pcl\"); print(check)\"",shell=True, capture_output=True, text=True)
     use_pcl = True
 
     if conda_test.stderr != '':
         if 'command not found' in conda_test.stderr:
-            ShowMessage('Error: `conda` wasn\'t found on the system. Using (slow) Yasara clustering')
+            w('Warning: `conda` wasn\'t found on the system. Using (slow) Yasara clustering')
         elif 'EnvironmentLocationNotFound' in conda_test.stderr:
-            ShowMessage('Error: `conda` found, but environment pcl_env doesn\t exist. Using (slow) Yasara clustering')
+            w('Warning: `conda` found, but environment pcl_env doesn\t exist. Using (slow) Yasara clustering')
         else:
-            ShowMessage('Error: the plugin was unsuccessful in running conda. Check the console. Using (slow) Yasara clustering')
+            w('Warning: the plugin was unsuccessful in running conda. Check the console. Using (slow) Yasara clustering')
             print(conda_test.stderr)
         print('To install pcl, install (Ana/mini)conda and do:\n$ conda create pcl_env\n$ conda activate pcl_env\n(pcl_env) $ conda install -c sirokujira pcl --channel conda-forge\n(pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge')
         use_pcl = False
     else:
         if conda_test.stdout == 'None\n\n':
-            ShowMessage('Warning: `conda` works and pcl_env exists, but pcl and/or python-pcl wasn\'t installed. Using (slow) Yasara clustering')
+            w('Warning: `conda` works and pcl_env exists, but pcl and/or python-pcl wasn\'t installed. Using (slow) Yasara clustering')
             Wait(20)
             print('To install pcl, install (Ana/mini)conda and do:\n$ conda create pcl_env\n$ conda activate pcl_env\n(pcl_env) $ conda install -c sirokujira pcl --channel conda-forge\n(pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge')
             # plugin.end()
