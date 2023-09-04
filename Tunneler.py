@@ -248,18 +248,18 @@ def generate_tunnel_points(target, point_protein_distance, pclfile, ignore_res):
 def cluster_tunnel_points(target, pclfile):
     print('Using pcl clustering method')
     # run pcl to cluster the points
-    noerr = subprocess.run(f"conda run -n pcl_env python -c \"\
+    noerr = subprocess.run(f'conda run -n pcl_env python -c "\
 import json\n\
 import pcl\n\
 from numpy import load, float32\n\
-points_to_cluster = load(\"{PWD()}{os.path.sep}{pclfile}\")\n\
+points_to_cluster = load(\'{PWD()}{os.path.sep}{pclfile}\')\n\
 cloud = pcl.PointCloud()\n\
 cloud.from_array(points_to_cluster.astype(float32))\n\
 ec = cloud.make_EuclideanClusterExtraction()\n\
 ec.set_ClusterTolerance(1.01 * {ball_spacing})\n\
 ec.set_MinClusterSize({min_vol / ball_spacing})\n\
-with open(\"{PWD()}{os.path.sep}point_clusters.json\", \"w\") as file:\n\
-    json.dump(ec.Extract(), file)\"", 
+with open(\'{PWD()}{os.path.sep}point_clusters.json\', \'w\') as file:\n\
+    json.dump(ec.Extract(), file)"', 
     shell=True, capture_output=True, text=True)
     with open(f'{PWD()}{os.path.sep}point_clusters.json', 'r') as file:
         sorted_cluster_indices = json.load(file)
@@ -435,7 +435,7 @@ if request == 'Tunneler':
     # Print(f'software check took {"{:.6f}".format(time.perf_counter()  - s_start_time)} seconds')
 
     s_start_time = time.perf_counter()
-    conda_test = subprocess.run(f"conda run -n pcl_env python -c \"import importlib.util; check = importlib.util.find_spec(\"pcl\"); print(check)\"",shell=True, capture_output=True, text=True)
+    conda_test = subprocess.run(f'conda run -n pcl_env python -c "import importlib.util; check = importlib.util.find_spec(\'pcl\'); print(check)"',shell=True, capture_output=True, text=True)
     use_pcl = True
 
     if conda_test.stderr != '':
@@ -445,7 +445,7 @@ if request == 'Tunneler':
             w('Warning: `conda` found, but environment pcl_env doesn\t exist. Using (slow) Yasara clustering')
         else:
             w('Warning: the plugin was unsuccessful in running conda. Check the console. Using (slow) Yasara clustering')
-            print(conda_test.stderr)
+            Print(conda_test.stderr)
         print('To install pcl, install (Ana/mini)conda and do:\n$ conda create pcl_env\n$ conda activate pcl_env\n(pcl_env) $ conda install -c sirokujira pcl --channel conda-forge\n(pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge')
         use_pcl = False
     else:
@@ -857,7 +857,3 @@ elif request == 'Colorbytunneldist':
 
 
 plugin.end()
-
-
-import timeit
-
