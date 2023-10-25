@@ -6,13 +6,7 @@
 # DESCRIPTION: This plugin identifies tunnels in protein structures
 #              Dependencies:
 #              Python:
-#              $ pip3 install numpy scipy
-#              PCL: I recommend installing via a conda environment
-#              $ conda create pcl_env
-#              $ conda activate pcl_env
-#              (pcl_env) $ conda install -c sirokujira pcl --channel conda-forge
-#              (pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge
-#              
+#              $ pip3 install numpy scipy scikit-learn
 #              Parameters: I recommend testing default parameters first. Then, play with the surface 
 
 """
@@ -245,22 +239,68 @@ def generate_tunnel_points(target, point_protein_distance, pclfile, ignore_res):
         w('Clustering points.')
 
 
-def cluster_tunnel_points(target, pclfile):
-    print('Using pcl clustering method')
-    # run pcl to cluster the points
-    noerr = subprocess.run(f'conda run -n pcl_env python -c "\
-import json\n\
-import pcl\n\
-from numpy import load, float32\n\
-points_to_cluster = load(\'{PWD()}{os.path.sep}{pclfile}\')\n\
-cloud = pcl.PointCloud()\n\
-cloud.from_array(points_to_cluster.astype(float32))\n\
-ec = cloud.make_EuclideanClusterExtraction()\n\
-ec.set_ClusterTolerance(1.01 * {ball_spacing})\n\
-ec.set_MinClusterSize({min_vol / ball_spacing})\n\
-with open(\'{PWD()}{os.path.sep}point_clusters.json\', \'w\') as file:\n\
-    json.dump(ec.Extract(), file)"', 
-    shell=True, capture_output=True, text=True)
+# def cluster_tunnel_points(target, pclfile):
+#     print('Using pcl clustering method')
+#     # run pcl to cluster the points
+#     noerr = subprocess.run(f'conda run -n pcl_env python -c "\
+# import json\n\
+# import pcl\n\
+# from numpy import load, float32\n\
+# points_to_cluster = load(\'{PWD()}{os.path.sep}{pclfile}\')\n\
+# cloud = pcl.PointCloud()\n\
+# cloud.from_array(points_to_cluster.astype(float32))\n\
+# ec = cloud.make_EuclideanClusterExtraction()\n\
+# ec.set_ClusterTolerance(1.01 * {ball_spacing})\n\
+# ec.set_MinClusterSize({min_vol / ball_spacing})\n\
+# with open(\'{PWD()}{os.path.sep}point_clusters.json\', \'w\') as file:\n\
+#     json.dump(ec.Extract(), file)"', 
+#     shell=True, capture_output=True, text=True)
+#     with open(f'{PWD()}{os.path.sep}point_clusters.json', 'r') as file:
+#         sorted_cluster_indices = json.load(file)
+ 
+#     points_names = np.array(ListAtom(f'Obj TunnelPoints', format='ATOMNUM'))
+#     for i, indices in enumerate(sorted_cluster_indices):
+#         c = DuplicateAtom(" ".join(str(i) for i in points_names[indices]))[0]
+#         NameObj(c, f"{target}Clu{len(indices):06d}")
+#         ColorObj (c, (i +1) * 25)
+#         new = DuplicateRes(f'obj {target} res protein with distance < 4 from obj {c}')
+#         NameObj(new, NameObj(c)[0] + 'A')
+
+#     RenumberObj(f'{target} {target}excluded {target}Close2Prot {target}Close2Surf', target)
+#     RenumberObj(f'{target} {target}excluded {target}Close2Prot {target}Close2Surf {target}Clu???????', target)
+#     DelObj(f'TunnelPoints')
+#     w('Finished clustering.')
+
+
+def cluster_tunnel_points_dbscan(target, pclfile):
+    from sklearn.cluster import DBSCAN
+
+    # Load the point cloud
+    points = np.load(f'{PWD()}{os.path.sep}{pclfile}')
+
+    # Perform DBSCAN clustering
+    clustering = DBSCAN(eps=ball_spacing * 1.1, min_samples=2).fit(points)
+    labels = clustering.labels_
+
+    # Set the minimum number of points a cluster must have
+    min_points = min_vol / ball_spacing
+
+    # Initialize an empty list for each cluster
+    num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    clusters = [[] for _ in range(num_clusters)]
+
+    # Populate the clusters with point indices
+    for index, label in enumerate(labels):
+        if label != -1:
+            clusters[label].append(index)
+
+    # Filter out small clusters
+    filtered_clusters = [cluster for cluster in clusters if len(cluster) >= min_points]
+
+    # Save the clusters to a JSON file
+    with open(f'{PWD()}{os.path.sep}point_clusters.json', 'w') as f:
+        json.dump(filtered_clusters, f)
+
     with open(f'{PWD()}{os.path.sep}point_clusters.json', 'r') as file:
         sorted_cluster_indices = json.load(file)
  
@@ -276,6 +316,7 @@ with open(\'{PWD()}{os.path.sep}point_clusters.json\', \'w\') as file:\n\
     RenumberObj(f'{target} {target}excluded {target}Close2Prot {target}Close2Surf {target}Clu???????', target)
     DelObj(f'TunnelPoints')
     w('Finished clustering.')
+
 
 def cluster_tunnel_points_nopcl(target, ball_spacing, pc_object='TunnelPoints'):
     print('Using Yasara clustering method')
@@ -328,7 +369,8 @@ def cluster_tunnel_points_nopcl(target, ball_spacing, pc_object='TunnelPoints'):
 Console("off")
 
 if request == 'Tunneler':
-    required_modules = { 'numpy': 'numpy', # Import name before colon, pip installation name after colon
+    required_modules = {'numpy': 'numpy', # Import name before colon, pip installation name after colon
+                        'sklearn': 'scikit-learn',
                         'scipy': 'scipy' } 
     missing_modules = [module for module in required_modules if not check_and_install_module(module)]
     if missing_modules:
@@ -417,46 +459,33 @@ if request == 'Tunneler':
                              "List",        50,130,f"Residues in object {target}",195,128,"Yes", len(uniq_res), sorted([item for item in uniq_res]),
                              "Button",     105,290, "OK")
         
-    w('Software dependency check. ')
-    PrintCon()
-    # old pcl check
+    # old check for pcl
+    # w('Software dependency check. ')
+    # PrintCon()
+
     # s_start_time = time.perf_counter()
-    # conda_test = subprocess.run(f"conda run -n pcl_env python -c 'import pcl'",shell=True, capture_output=True, text=True)
+    # conda_test = subprocess.run(f'conda run -n pcl_env python -c "import importlib.util; check = importlib.util.find_spec(\'pcl\'); print(check)"',shell=True, capture_output=True, text=True)
+    # use_pcl = True
+
     # if conda_test.stderr != '':
     #     if 'command not found' in conda_test.stderr:
-    #         ShowMessage('Error: `conda` wasn\'t found on the system.')
+    #         w('Warning: `conda` wasn\'t found on the system. Using (slow) Yasara clustering')
     #     elif 'EnvironmentLocationNotFound' in conda_test.stderr:
-    #         ShowMessage('Error: `conda` found, but environment pcl_env doesn\t exist.')
-    #     elif 'No module named' in conda_test.stderr:
-    #         ShowMessage('Error: `conda` works and pcl_env exists, but pcl and/or python-pcl wasn\'t installed.')
+    #         w('Warning: `conda` found, but environment pcl_env doesn\t exist. Using (slow) Yasara clustering')
+    #     else:
+    #         w('Warning: the plugin was unsuccessful in running conda. Check the console. Using (slow) Yasara clustering')
+    #         Print(conda_test.stderr)
     #     print('To install pcl, install (Ana/mini)conda and do:\n$ conda create pcl_env\n$ conda activate pcl_env\n(pcl_env) $ conda install -c sirokujira pcl --channel conda-forge\n(pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge')
-    #     plugin.end()
-   
-    # Print(f'software check took {"{:.6f}".format(time.perf_counter()  - s_start_time)} seconds')
-
-    s_start_time = time.perf_counter()
-    conda_test = subprocess.run(f'conda run -n pcl_env python -c "import importlib.util; check = importlib.util.find_spec(\'pcl\'); print(check)"',shell=True, capture_output=True, text=True)
-    use_pcl = True
-
-    if conda_test.stderr != '':
-        if 'command not found' in conda_test.stderr:
-            w('Warning: `conda` wasn\'t found on the system. Using (slow) Yasara clustering')
-        elif 'EnvironmentLocationNotFound' in conda_test.stderr:
-            w('Warning: `conda` found, but environment pcl_env doesn\t exist. Using (slow) Yasara clustering')
-        else:
-            w('Warning: the plugin was unsuccessful in running conda. Check the console. Using (slow) Yasara clustering')
-            Print(conda_test.stderr)
-        print('To install pcl, install (Ana/mini)conda and do:\n$ conda create pcl_env\n$ conda activate pcl_env\n(pcl_env) $ conda install -c sirokujira pcl --channel conda-forge\n(pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge')
-        use_pcl = False
-    else:
-        if conda_test.stdout == 'None\n\n':
-            w('Warning: `conda` works and pcl_env exists, but pcl and/or python-pcl wasn\'t installed. Using (slow) Yasara clustering')
-            Wait(20)
-            print('To install pcl, install (Ana/mini)conda and do:\n$ conda create pcl_env\n$ conda activate pcl_env\n(pcl_env) $ conda install -c sirokujira pcl --channel conda-forge\n(pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge')
-            # plugin.end()
-            use_pcl = False
+    #     use_pcl = False
+    # else:
+    #     if conda_test.stdout == 'None\n\n':
+    #         w('Warning: `conda` works and pcl_env exists, but pcl and/or python-pcl wasn\'t installed. Using (slow) Yasara clustering')
+    #         Wait(20)
+    #         print('To install pcl, install (Ana/mini)conda and do:\n$ conda create pcl_env\n$ conda activate pcl_env\n(pcl_env) $ conda install -c sirokujira pcl --channel conda-forge\n(pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge')
+    #         # plugin.end()
+    #         use_pcl = False
  
-    Print(f'software check v2 took {"{:.6f}".format(time.perf_counter()  - s_start_time)} seconds')
+    # Print(f'software check v2 took {"{:.6f}".format(time.perf_counter()  - s_start_time)} seconds')
 
 
     # import required libraries
@@ -534,10 +563,12 @@ if request == 'Tunneler':
                 AddObj('All')
                 SwitchObj(f'MD?_{target_name}', 'OFF')
 
-    if use_pcl:
-        cluster_tunnel_points(target, pclfile='points_to_cluster.npy')
-    else:
-        cluster_tunnel_points_nopcl(target, ball_spacing, pc_object='TunnelPoints')
+    # old pcl check
+    # if use_pcl:
+    #     cluster_tunnel_points(target, pclfile='points_to_cluster.npy')
+    # else:
+    #     cluster_tunnel_points_nopcl(target, ball_spacing, pc_object='TunnelPoints')
+    cluster_tunnel_points_dbscan(target, pclfile='points_to_cluster.npy')
 
     CenterAtom('All')
     BallStickAll()
@@ -560,10 +591,10 @@ if request == 'Tunneler':
     SwitchObj(f'{str(target)}TPolygon?', 'off')
     SaveSce(f'org_{NameObj(target)[0]}_tunnels.sce')
     PrintCon()
-    Print(f'Ran tunnels plugin in {"{:.2f}".format(time.perf_counter()  - start_time)} seconds on object {selection[0].objects} with parameters: \n   Exclude surface atoms up to                     {ignore_surface}\n   Ball spacing                                    {ball_spacing}\n   Maximum allowed ball distance to protein        {max_ball_protein}\n   Prevent tunnel surface connection with cutoff   {surf_con_prev}')
+    Print(f'Ran tunnels plugin in {"{:.2f}".format(time.perf_counter()  - start_time)} seconds on object {selection[0].objects} with parameters: \n   Exclude surface atoms up to                     {ignore_surface}\n   Ball spacing                                    {ball_spacing}\n   Min volume                                      {min_vol}\n   Maximum allowed ball distance to protein        {max_ball_protein}\n   Prevent tunnel surface connection with cutoff   {surf_con_prev}')
 
     img = MakeImage("Buttons",topcol="None",bottomcol="None")
-    ShowImage(img,alpha=66,priority=0)
+    ShowImage(img,alpha=66,priority=1)
     PrintImage(img)
 
     def ShowButtons():
