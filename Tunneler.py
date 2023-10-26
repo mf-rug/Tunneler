@@ -17,7 +17,6 @@ MainMenu: Analyze
       Request: Tunneler
 """
 
-# check if dependencies are available
 from yasara import *
 import importlib
 import sys
@@ -25,6 +24,7 @@ import subprocess
 import re
 from configparser import ConfigParser
 
+############################################ Functions #################################################
 def check_and_install_module(module_name):
     try:
         importlib.import_module(module_name)
@@ -121,43 +121,7 @@ def point_cloud(target, ignore_surface, keep_surf_points, surf_con_prev, build_p
     shape_points = get_shape_points(cube_points, hull_vertices)
 
     if keep_surf_points:
-        # # Calculate the plane normals
-        # triangle_normals = np.cross(
-        #     hull_vertices[hull_simplices[:, 1]] - hull_vertices[hull_simplices[:, 0]],
-        #     hull_vertices[hull_simplices[:, 2]] - hull_vertices[hull_simplices[:, 0]]
-        # )
-        # triangle_normals /= np.linalg.norm(triangle_normals, axis=1)[:, np.newaxis]
-
-        # # Calculate the distances from each point to the planes defined by the triangles
-        # distances = np.empty((len(shape_points), len(hull_simplices)))
-        # for i, triangle in enumerate(hull_simplices):
-        #     triangle_vertices = hull_vertices[triangle]
-        #     distances[:, i] = np.abs(
-        #         np.dot(shape_points - triangle_vertices[0], triangle_normals[i])
-        #     )
-
-        # # Check if any distance in each row is less than or equal to the threshold
-        # threshold_mask = np.any(distances <= surf_con_prev, axis=1)
-        # outer_points = shape_points[threshold_mask]
-        # shape_points = shape_points[~threshold_mask]
-
-
         shape_points2 = get_shape_points(cube_points, hull_vertices2)
-
-        # # Combine the arrays and sort
-        # combined_array = np.vstack((shape_points, shape_points2))
-        # sorted_indices = np.lexsort(combined_array.T)
-        # sorted_combined = combined_array[sorted_indices]
-
-        # # Calculate the differences between consecutive rows and get 0s (duplos)
-        # differences = np.diff(sorted_combined, axis=0)
-        # duplicate_mask = np.allclose(differences, 0, atol=1e-6)
-        # duplicate_indices = np.where(duplicate_mask)[0]
-
-        # # Separate  duplicate rows from  combined array & find unique rows in shape_points
-        # duplicate_rows = sorted_combined[duplicate_indices]
-        # outer_points = np.setdiff2d(shape_points, duplicate_rows, assume_unique=True, equal_nan=True)
-        # shape_points = shape_points2
 
         nrows, ncols = shape_points.shape
         dtype = {'names': ['f{}'.format(i) for i in range(ncols)],
@@ -168,7 +132,6 @@ def point_cloud(target, ignore_surface, keep_surf_points, surf_con_prev, build_p
         # Convert structured array to a regular array
         outer_points = non_common_rows.view(shape_points.dtype).reshape(-1, ncols)
         shape_points = shape_points2
-
 
     else:
         outer_points = None
@@ -209,20 +172,6 @@ def generate_tunnel_points(target, point_protein_distance, pclfile, ignore_res):
 
     DelAtom(f'Obj {target}inside {target}excluded with distance < {point_protein_distance} from Obj {target} {ignore_res}')
 
-    # remove points outside the accessible surface with large water probe
-    # Deprecated feature 
-    # if remove_surface_points:
-    #     SurfPar(probe=3)
-    #     prot = DuplicateAtom(f'obj {target} res protein')[0]
-    #     tun = DuplicateObj(f'{target}inside')[0]
-    #     JoinObj(tun, prot)
-    #     keep = DuplicateAtom(f'obj {target}inside with distance < 7.5 from accessible surface of obj {prot}')
-    #     NameObj(keep, f'{target}Close2Surf')
-    #     DelAtom(f'obj {target}inside with distance < 7.5 from accessible surface of obj {prot}')
-    #     DelObj(prot)
-    #     RenumberObj(keep, prot)
-    #     SurfPar(probe=1.4)
-
     # Combine existing tunnel points (if we are doing iterative analysis)
     if ListObj('TunnelPoints') != []:
         DelAtom(f'Obj {target}inside with distance < 0.01 from obj TunnelPoints')
@@ -237,39 +186,6 @@ def generate_tunnel_points(target, point_protein_distance, pclfile, ignore_res):
         w('Proceeding with MD.')
     else:
         w('Clustering points.')
-
-
-# def cluster_tunnel_points(target, pclfile):
-#     print('Using pcl clustering method')
-#     # run pcl to cluster the points
-#     noerr = subprocess.run(f'conda run -n pcl_env python -c "\
-# import json\n\
-# import pcl\n\
-# from numpy import load, float32\n\
-# points_to_cluster = load(\'{PWD()}{os.path.sep}{pclfile}\')\n\
-# cloud = pcl.PointCloud()\n\
-# cloud.from_array(points_to_cluster.astype(float32))\n\
-# ec = cloud.make_EuclideanClusterExtraction()\n\
-# ec.set_ClusterTolerance(1.01 * {ball_spacing})\n\
-# ec.set_MinClusterSize({min_vol / ball_spacing})\n\
-# with open(\'{PWD()}{os.path.sep}point_clusters.json\', \'w\') as file:\n\
-#     json.dump(ec.Extract(), file)"', 
-#     shell=True, capture_output=True, text=True)
-#     with open(f'{PWD()}{os.path.sep}point_clusters.json', 'r') as file:
-#         sorted_cluster_indices = json.load(file)
- 
-#     points_names = np.array(ListAtom(f'Obj TunnelPoints', format='ATOMNUM'))
-#     for i, indices in enumerate(sorted_cluster_indices):
-#         c = DuplicateAtom(" ".join(str(i) for i in points_names[indices]))[0]
-#         NameObj(c, f"{target}Clu{len(indices):06d}")
-#         ColorObj (c, (i +1) * 25)
-#         new = DuplicateRes(f'obj {target} res protein with distance < 4 from obj {c}')
-#         NameObj(new, NameObj(c)[0] + 'A')
-
-#     RenumberObj(f'{target} {target}excluded {target}Close2Prot {target}Close2Surf', target)
-#     RenumberObj(f'{target} {target}excluded {target}Close2Prot {target}Close2Surf {target}Clu???????', target)
-#     DelObj(f'TunnelPoints')
-#     w('Finished clustering.')
 
 
 def cluster_tunnel_points_dbscan(target, pclfile):
@@ -303,6 +219,7 @@ def cluster_tunnel_points_dbscan(target, pclfile):
 
     with open(f'{PWD()}{os.path.sep}point_clusters.json', 'r') as file:
         sorted_cluster_indices = json.load(file)
+        sorted_cluster_indices = sorted(sorted_cluster_indices, key=len, reverse=True)
  
     points_names = np.array(ListAtom(f'Obj TunnelPoints', format='ATOMNUM'))
     for i, indices in enumerate(sorted_cluster_indices):
@@ -318,57 +235,33 @@ def cluster_tunnel_points_dbscan(target, pclfile):
     w('Finished clustering.')
 
 
-def cluster_tunnel_points_nopcl(target, ball_spacing, pc_object='TunnelPoints'):
-    print('Using Yasara clustering method')
-    counter = 1
-    while True:
-        if counter > 1:
-            chk = ListObj(pc_object)
-            if chk == []:
-                break
-        try:
-            cur = ListAtom('obj ' + str(pc_object))
-        except RuntimeError:
-            ShowMessage('No tunnels found')
-            plugin.end()
-        SelectAtom(cur[0])
-        org = 0
-        while True:
-            new_atms = ListAtom(f'obj {pc_object} atom !selected with distance < {(ball_spacing / 2) + ball_spacing} from obj {pc_object} atom selected', format="ATOMNUM")
-            SelectAtom(" ".join([str(x) for x in new_atms]), mode="add")
-            org = org + len(new_atms)
-            if len(new_atms) == 0:
-                c = DuplicateAtom('Selected')[0]
-                NameObj(c, f"{target}Clu{CountAtom(f'obj {c}'):06d}")
-                counter += 1
-                DelAtom('obj ' + str(pc_object) + ' atom selected')
-                UnselectAll()
-                break
+def ShowButtons():
+    img = MakeImage("Buttons",topcol="None",bottomcol="None")
+    ShowImage(img,alpha=85,priority=1)
+    PrintImage(img)
+    Font("Arial",height=13,color="black")
+    h = 39
+    ShowButton("Tunnel on/off",x='12%', y='55%',color="White", height=h)
+    ShowButton("Target on/off",x='12%', y='60%',color="White", height=h)
+    ShowButton("Surf",x='3%', y='65%',color="White", height=h)
+    ShowButton("H2O",x='7.5%', y='65%',color="White", height=h)
+    ShowButton("SecStr",x='13%', y='65%',color="White", height=h)
+    ShowButton("Nonprot",x='20%', y='65%',color="White", height=h)
+    ShowButton("Color by tunnel/dist",x='12%', y='70%',color="White", height=h)
+    ShowButton("Spheres",x='5%', y='75%',color="White", height=h)
+    ShowButton("Balls",x='12%', y='75%',color="White", height=h)
+    ShowButton("Points",x='18%', y='75%',color="White", height=h)
+    ShowButton("Remove inside points",x='12%', y='80%',color="White", height=h)
+    ShowButton("Exit",x='12%', y='85%',color="Red", height=h)
 
-    org_obj_nums = ListObj(f'{target}Clu??????', format='OBJNUM')
-    free_obj_num = max(ListObj('All', format='OBJNUM')) + 1
-    RenumberObj(f'{target}Clu??????', free_obj_num)
-
-    obj_names = ListObj(f'{target}Clu??????', format='OBJNAME')
-    obj_nums = ListObj(f'{target}Clu??????', format='OBJNUM')
-    obj_nums_sorted = [x for _, x in reversed(sorted(zip(obj_names, obj_nums)))]
-
-    for i, obj in enumerate(obj_nums_sorted):
-        ColorObj (obj, (i +1) * 25)
-        RenumberObj(obj, org_obj_nums[i])
-    
-    for obj in ListObj(f'{target}Clu??????', format='OBJNUM'):
-        new = DuplicateRes(f'obj {target} res protein with distance < 4 from obj {obj}')
-        NameObj(new, NameObj(obj)[0] + 'A')
-
-    RenumberObj(f'{target} {target}excluded {target}Close2Prot {target}Close2Surf', target)
-    RenumberObj(f'{target} {target}excluded {target}Close2Prot {target}Close2Surf {target}Clu???????', target)
-    DelObj(f'TunnelPoints')
-    w('Finished clustering.')
+###########################################################################################################
+###########################################################################################################
 
 Console("off")
 
+########################################## Tunneler request ###############################################
 if request == 'Tunneler':
+    # check if dependencies are available
     required_modules = {'numpy': 'numpy', # Import name before colon, pip installation name after colon
                         'sklearn': 'scikit-learn',
                         'scipy': 'scipy' } 
@@ -386,41 +279,65 @@ if request == 'Tunneler':
         if install_choice == 'Yes':
             for module in missing_modules:
                 install_name = required_modules[module]
-                subprocess.call([sys.executable, '-m', 'pip', 'install', install_name])
+                no_err = subprocess.call([sys.executable, '-m', 'pip', 'install', install_name])
+                print(no_err)
         else:
             ShowMessage("Some python modules are missing, try installing manually. Exiting.")
             plugin.end()
 
-    # check previously saved parameters
-    if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tunneler.ini')):
-        print('found prev. settings')
-        settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tunneler.ini')
+    # get previous settings
+    config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tunneler_config.ini')
+    if os.path.exists(config_file):
+        # Initialize a ConfigParser object
+        config = ConfigParser()
+
+        # Read the configuration file
+        config.read(config_file)
+
+        # Retrieve the values from the "Variables" section and set variables
+        variables = {}
+        for key, value in config['Variables'].items():
+            # Try to convert the value to a float or int, or keep it as a string if that fails
+            try:
+                variables[key] = int(value)
+            except ValueError:
+                try:
+                    variables[key] = float(value)
+                except ValueError:
+                    variables[key] = value
+
+        # Set variables with the same names as the keys
+        globals().update(variables)
     else:
-        print('no sets')
+        ignore_surface, ball_spacing, max_ball_protein, keep_prot_points, surf_con_prev, keep_surf_points, mds, min_vol, use_all_res, build_pol, prog = 3.8, 0.33, 2.8, False, 2.7, False, 0, 50, 2, True, 2
+
     # Ask user input for parameters
-    ignore_surface, ball_spacing, max_ball_protein, keep_prot_points, surf_con_prev, keep_surf_points, mds, min_vol, use_all_res, build_pol, prog =\
+    butn, ignore_surface, ball_spacing, max_ball_protein, keep_prot_points, surf_con_prev, keep_surf_points, mds, min_vol, use_all_res, build_pol, prog  =\
         ShowWin("Custom","Step 2: Tunnel analysis parameters",600,380,
-                "NumberInput",         20, 50, "_I_gnore surface up to (A)", 3.8, 0, 10,
-                "NumberInput",         315, 50, "Ball _s_pacing (A)", 0.33, 0, 2,
-                "NumberInput",         315, 125, "Max ball-protein _d_istance (A)", 2.8, 2, 4,
+                "NumberInput",         20, 50, "_I_gnore surface up to (A)", ignore_surface, 0, 10,
+                "NumberInput",         315, 50, "Ball _s_pacing (A)", ball_spacing, 0, 2,
+                "NumberInput",         315, 125, "Max ball-protein _d_istance (A)", max_ball_protein, 2, 4,
                 "Text",                477, 157, "Keep points",
-                "CheckBox",            440, 148, "", False,
-                "NumberInput",         20, 125, "Surface connection prevention (A)", 2.7, 0, 10,
+                "CheckBox",            440, 148, "", keep_prot_points,
+                "NumberInput",         20, 125, "Surface connection prevention (A)", surf_con_prev, 0, 10,
                 "Text",                192, 157, "Keep points",
-                "CheckBox",            155, 148, "", False,
-                "NumberInput",         20, 200, "Number of MD iterations", 0, 0, 10,
-                "NumberInput",         315, 200, "Min. cluster volume (A^3)", 50, 1, 1000,
-                "RadioButtons",  2, 2, 250, 260,  "Use all residues in selected target",
-                                    250, 300,  "Select residues to ignore",
-                "CheckBox",            250, 340, "Build Polygon", True,
-                "RadioButtons",  3, 2, 20, 260,  "No progress (fast)",
+                "CheckBox",            155, 148, "", keep_surf_points,
+                "NumberInput",         20, 200, "Number of MD iterations", mds, 0, 10,
+                "NumberInput",         315, 200, "Min. cluster volume (A^3)", min_vol, 1, 1000,
+                "RadioButtons",  2, use_all_res, 225, 260,  "Use all residues in selected target",
+                                    225, 300,  "Select residues to ignore",
+                "CheckBox",            225, 340, "Build Polygon", build_pol,
+                "RadioButtons",  3, prog, 20, 260,  "No progress (fast)",
                                     20, 300,  "Show progress",
                                     20, 340,  "Debug",
-                "Button",              540, 340, "_O_K")
+                "Button",              530, 300, "Reset & Run",
+                "Button",              530, 340, "Run")
     
+    # User resets settings
+    if butn == 'Reset&Run':
+        ignore_surface, ball_spacing, max_ball_protein, keep_prot_points, surf_con_prev, keep_surf_points, mds, min_vol, use_all_res, build_pol, prog = 3.8, 0.33, 2.8, False, 2.7, False, 0, 50, 2, True, 2
 
-
-    # Example variables
+    # write config
     variables = {
         'ignore_surface':ignore_surface,
         'ball_spacing':ball_spacing,
@@ -442,11 +359,10 @@ if request == 'Tunneler':
         config['Variables'][name] = str(value)
 
     # Save the variables to an INI file
-    with open('config.ini', 'w') as configfile:
+    with open(config_file, 'w') as configfile:
         config.write(configfile)
 
-    print("Variables saved to config.ini")
-
+    # parse settings
     target = [selection[0].object[j].number.inyas for j in range(selection[0].objects)][0]
     target_name = NameObj(target)[0]
 
@@ -459,43 +375,18 @@ if request == 'Tunneler':
                              "List",        50,130,f"Residues in object {target}",195,128,"Yes", len(uniq_res), sorted([item for item in uniq_res]),
                              "Button",     105,290, "OK")
         
-    # old check for pcl
-    # w('Software dependency check. ')
-    # PrintCon()
-
-    # s_start_time = time.perf_counter()
-    # conda_test = subprocess.run(f'conda run -n pcl_env python -c "import importlib.util; check = importlib.util.find_spec(\'pcl\'); print(check)"',shell=True, capture_output=True, text=True)
-    # use_pcl = True
-
-    # if conda_test.stderr != '':
-    #     if 'command not found' in conda_test.stderr:
-    #         w('Warning: `conda` wasn\'t found on the system. Using (slow) Yasara clustering')
-    #     elif 'EnvironmentLocationNotFound' in conda_test.stderr:
-    #         w('Warning: `conda` found, but environment pcl_env doesn\t exist. Using (slow) Yasara clustering')
-    #     else:
-    #         w('Warning: the plugin was unsuccessful in running conda. Check the console. Using (slow) Yasara clustering')
-    #         Print(conda_test.stderr)
-    #     print('To install pcl, install (Ana/mini)conda and do:\n$ conda create pcl_env\n$ conda activate pcl_env\n(pcl_env) $ conda install -c sirokujira pcl --channel conda-forge\n(pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge')
-    #     use_pcl = False
-    # else:
-    #     if conda_test.stdout == 'None\n\n':
-    #         w('Warning: `conda` works and pcl_env exists, but pcl and/or python-pcl wasn\'t installed. Using (slow) Yasara clustering')
-    #         Wait(20)
-    #         print('To install pcl, install (Ana/mini)conda and do:\n$ conda create pcl_env\n$ conda activate pcl_env\n(pcl_env) $ conda install -c sirokujira pcl --channel conda-forge\n(pcl_env) $ conda install -c sirokujira python-pcl --channel conda-forge')
-    #         # plugin.end()
-    #         use_pcl = False
- 
-    # Print(f'software check v2 took {"{:.6f}".format(time.perf_counter()  - s_start_time)} seconds')
-
-
     # import required libraries
     import numpy as np
     from scipy.spatial import ConvexHull, Delaunay
     import json
 
     start_time = time.perf_counter()
+    if ListImage('All') != []:
+        PrintImage(1)
+        FillRect(color='None')
+        DelImage(1)
 
-    DelObj(f'{target}excluded {target}TPolygon? {target}Clu???????? {target}Close2Surf {target}Close2Prot {target}Surf CenterHlp Du {target}CutPlane ???_Sphere')
+    DelObj(f'{target}excluded {target}TPolygon? {target}Clu???????? {target}Close2Surf {target}Close2Prot {target}Surf {target}SS {target}NonProt {target}H2O CenterHlp Du {target}CutPlane ???_Sphere')
 
     # create dummy objects to fill object list gaps
     all_objs = ListObj('all')
@@ -563,11 +454,6 @@ if request == 'Tunneler':
                 AddObj('All')
                 SwitchObj(f'MD?_{target_name}', 'OFF')
 
-    # old pcl check
-    # if use_pcl:
-    #     cluster_tunnel_points(target, pclfile='points_to_cluster.npy')
-    # else:
-    #     cluster_tunnel_points_nopcl(target, ball_spacing, pc_object='TunnelPoints')
     cluster_tunnel_points_dbscan(target, pclfile='points_to_cluster.npy')
 
     CenterAtom('All')
@@ -589,32 +475,13 @@ if request == 'Tunneler':
     RotateObj(co2, x=90)
     SwitchObj(f'{co1} {co2}', 'OFF')
     SwitchObj(f'{str(target)}TPolygon?', 'off')
-    SaveSce(f'org_{NameObj(target)[0]}_tunnels.sce')
+    SaveSce(f'{NameObj(target)[0]}_tunnels.sce')
     PrintCon()
     Print(f'Ran tunnels plugin in {"{:.2f}".format(time.perf_counter()  - start_time)} seconds on object {selection[0].objects} with parameters: \n   Exclude surface atoms up to                     {ignore_surface}\n   Ball spacing                                    {ball_spacing}\n   Min volume                                      {min_vol}\n   Maximum allowed ball distance to protein        {max_ball_protein}\n   Prevent tunnel surface connection with cutoff   {surf_con_prev}')
 
-    img = MakeImage("Buttons",topcol="None",bottomcol="None")
-    ShowImage(img,alpha=66,priority=1)
-    PrintImage(img)
-
-    def ShowButtons():
-        Font("Arial",height=14,color="black")
-
-        ShowButton("Tunnel on/off",x='12%', y='55%',color="White", height=40)
-        ShowButton("Target on/off",x='12%', y='60%',color="White", height=40)
-        ShowButton("Surf",x='3%', y='65%',color="White", height=40)
-        ShowButton("SecStr",x='9%', y='65%',color="White", height=40)
-        ShowButton("Nonprot",x='17%', y='65%',color="White", height=40)
-        ShowButton("Color by tunnel/dist",x='12%', y='70%',color="White", height=40)
-        ShowButton("Spheres",x='5%', y='75%',color="White", height=40)
-        ShowButton("Balls",x='12%', y='75%',color="White", height=40)
-        ShowButton("Points",x='18%', y='75%',color="White", height=40)
-        ShowButton("Remove inside points",x='12%', y='80%',color="White", height=40)
-        ShowButton("Exit",x='12%', y='85%',color="Red", height=40)
-
-
     ShowButtons()
 
+########################################## Button requests ###############################################
 elif request == 'Tunnelonoff':
     current = SwitchObj('?Clu??????')[0]
     if current == 'Off':
@@ -624,18 +491,75 @@ elif request == 'Tunnelonoff':
 
 elif request == 'Targetonoff':
     target = ListObj('?Surf', format='OBJNAME')[0][0]
-    current = SwitchObj(target)[0]
-    if current == 'Off':
-        SwitchObj(target, 'ON')
+    current = SwitchObj(f'{target} {target}SS {target}H2O {target}Surf {target}NonProt')
+    current = [True if x == 'On' else False for x in current]
+    if any(current):
+        print('some are on, so turning all off')
+        print(SwitchObj(f'{target} {target}SS {target}H2O {target}Surf {target}NonProt'))
+        SwitchObj(f'{target} {target}SS {target}H2O {target}Surf {target}NonProt', 'OFF')
     else:
-        SwitchObj(target, 'OFF')
+        print('none on, so ')
+        print(SwitchObj(f'{target} {target}SS {target}H2O {target}Surf {target}NonProt'))
+        SwitchObj(target, 'ON')
+
+elif request == 'SecStr':
+    target = ListObj('?Surf', format='OBJNAME')[0][0]
+    SwitchObj(target, 'OFF')
+    if ListObj(f'{target}SS', format='OBJNUM') == []:
+        new = DuplicateObj(target)[0]
+        SwitchObj(new, 'ON')
+        HideObj(new)
+        ShowSecStrObj(new)
+        NameObj(new, f'{target}SS')
+    else:
+        current = SwitchObj(f'{target}SS')[0]
+        if current == 'Off':
+            SwitchObj(f'{target}SS', 'ON')
+        else:
+            SwitchObj(f'{target}SS', 'OFF')
+
+elif request == 'Nonprot':
+    target = ListObj('?Surf', format='OBJNAME')[0][0]
+    SwitchObj(target, 'OFF')
+    if ListObj(f'{target}NonProt', format='OBJNUM') == []:
+        new = DuplicateObj(target)[0]
+        SwitchObj(new, 'ON')
+        HideObj(new)
+        HideSecStrObj(new)
+        ShowRes(f'Obj {new} res !protein and !hoh')
+        NameObj(new, f'{target}NonProt')
+    else:
+        current = SwitchObj(f'{target}NonProt')[0]
+        if current == 'Off':
+            SwitchObj(f'{target}NonProt', 'ON')
+        else:
+            SwitchObj(f'{target}NonProt', 'OFF')
+
+elif request == 'H2O':
+    target = ListObj('?Surf', format='OBJNAME')[0][0]
+    SwitchObj(target, 'OFF')
+    if ListObj(f'{target}H2O', format='OBJNUM') == []:
+        new = DuplicateObj(target)[0]
+        SwitchObj(new, 'ON')
+        HideObj(new)
+        HideSecStrObj(new)
+        ShowRes(f'Obj {new} res hoh')
+        NameObj(new, f'{target}H2O')
+    else:
+        current = SwitchObj(f'{target}H2O')[0]
+        if current == 'Off':
+            SwitchObj(f'{target}H2O', 'ON')
+        else:
+            SwitchObj(f'{target}H2O', 'OFF')
 
 elif request == 'Surf':
-    current = SwitchObj('1Surf')[0]
+    import re
+    target = ListObj('?Surf', format='OBJNAME')[0][0]
+    current = SwitchObj(f'{target}Surf')[0]
     if current == 'Off':
-        SwitchObj('1Surf', 'ON')
+        SwitchObj(f'{target}Surf', 'ON')
     else:
-        SwitchObj('1Surf', 'OFF')
+        SwitchObj(f'{target}Surf', 'OFF')
 
 elif request == 'Removeinsidepoints':
     import re
@@ -666,11 +590,11 @@ elif request == 'Removeinsidepoints':
     HideMessage()
 
 elif request == 'Exit':
-    # yasara bug? Doesn't remove button
-    # FillRect(color='None')
-    SaveSce('ExitTunnels.sce')
-    Clear()
-    LoadSce('ExitTunnels.sce')
+    target = ListObj('?Surf', format='OBJNAME')[0][0]
+    PrintImage(1)
+    FillRect(color='None')
+    DelImage(1)
+    SaveSce(f'{NameObj(target)}_tunnels_exit.sce')
 
 elif request == 'Balls':
     on_tunnels = [x for x,y in zip(ListObj('?Clu??????'), SwitchObj('?Clu??????')) if y == 'On']
@@ -693,7 +617,6 @@ elif request == 'Spheres':
         on_tunnels = [x for x,y in zip(ListObj('?Clu??????'), SwitchObj('?Clu??????')) if y == 'On']
         SwitchObj(" ".join([str(f'{x:03d}') + '_Sphere' for x in on_tunnels]), "on")
         SwitchObj('?Clu??????', 'off')
-        # SwitchObj(" ".join([x for x in NameObj('All') if re.search('^[0-9]+_sphere$', x)]), 'ON')
     else:
         a,r = ShowWin("Custom","Parameters for spheres",300,170,
                       "NumberInput",  20, 48,"Alpha",19,1,100,
