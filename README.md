@@ -10,7 +10,7 @@
 $ pip3 install numpy scipy shapely matplotlib scikit-learn tk
 ```
 
-On macOS, you may have to install the proper python3 tkinter in [this way]([url](https://stackoverflow.com/questions/68554782/modulenotfounderror-no-module-named-tkinter-on-macos)):
+On macOS, you may have to install the proper python3 tkinter in [this way](https://stackoverflow.com/questions/68554782/modulenotfounderror-no-module-named-tkinter-on-macos):
 ```
 $ brew install python-tk
 ```
