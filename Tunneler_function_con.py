@@ -316,8 +316,14 @@ def write_cif_file(points, output_file, ori='right'):
         ori: 'right' negates the X coordinate (YASARA uses a right-handed
              coordinate system that needs mirroring for some operations).
     """
-    atom_labels = ['ATOM{}'.format(i) for i in range(1, len(points) + 1)]
-    atom_symbols = ['X' for _ in range(len(points))]  
+    # YASARA maps _atom_site_label -> the atom name, which is capped at 4
+    # characters. Labels like 'ATOM1' trip error 101 ("atom name is longer
+    # than four characters") on newer YASARA CIF parsers, while older ones
+    # accepted them. Encode the index in base-36 so labels stay <=4 chars
+    # (unique up to 36**4 points; harmless duplicates beyond -- the label is
+    # never referenced downstream, atoms are selected by object/element/pos).
+    atom_labels = [np.base_repr(i % 36**4, 36) for i in range(len(points))]
+    atom_symbols = ['X' for _ in range(len(points))]
     with open(output_file, 'w') as cif_file:
         cif_file.write('data_\n_cell_length_a   1.0\n_cell_length_b   1.0\n_cell_length_c   1.0\n_cell_angle_alpha   90.0\n_cell_angle_beta    90.0\n_cell_angle_gamma   90.0\nloop_\n_atom_site_label\n_atom_site_type_symbol\n_atom_site_fract_x\n_atom_site_fract_y\n_atom_site_fract_z\n')
         if ori == 'right':
