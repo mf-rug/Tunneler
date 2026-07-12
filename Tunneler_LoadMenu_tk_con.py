@@ -57,6 +57,11 @@ def rescale_floats_to_range(float_list, min_int, max_int, min_float=None, max_fl
     scaled_list = [int((x - min_float) / (max_float - min_float) * (max_int - min_int) + min_int) for x in float_list]
     return scaled_list
 
+def chunks(lst, n):
+    """Yield successive length-*n* slices of *lst* (used to batch coloring work)."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
 def check_and_install_module(module_name):
     """Return True if *module_name* can be imported, False otherwise."""
     try:
@@ -131,7 +136,7 @@ def tunneler_dialog():
         """Return the object number (as string) of the protein that has tunnels, or None."""
         Console("OFF")
         if PairObj('All', 'ball_spacing') != [] and ListObj('?Cl??????? ??Cl???????') != []:
-            return(re.findall('^\d+', ListObj('?Cl??????? ??Clu???????', format='OBJNAME')[0])[0])
+            return(re.findall(r'^\d+', ListObj('?Cl??????? ??Cl???????', format='OBJNAME')[0])[0])
         else:
             return(None)
         
