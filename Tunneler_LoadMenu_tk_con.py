@@ -35,15 +35,6 @@ MainMenu: Analyze
 import sys
 import os
 
-# TEMP launch-logger (stdlib only): records which interpreter actually ran, so we
-# can confirm whether YASARA is using the dedicated venv. Remove once settled.
-try:
-    with open(os.path.expanduser('~/tunneler_launch_debug.txt'), 'w') as _f:
-        _f.write('executable %r\nprefix %r\nin_venv %s\n'
-                 % (sys.executable, sys.prefix, 'yasara-venv' in sys.prefix))
-except Exception:
-    pass
-
 # YASARA runs plugins from the plg/ folder (it sets the working directory there)
 # and provides the `yasara` module as plg/yasara.py. Normally sys.path[0] is the
 # script's folder (plg/), so the import just works -- but when this file is a
