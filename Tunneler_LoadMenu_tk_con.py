@@ -34,8 +34,7 @@ MainMenu: Analyze
 
 import sys
 from yasara import *
-import importlib
-import subprocess
+from Tunneler_env_check import ensure_dependencies
 
 
 # ============================================================
@@ -62,39 +61,17 @@ def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-def check_and_install_module(module_name):
-    """Return True if *module_name* can be imported, False otherwise."""
-    try:
-        importlib.import_module(module_name)
-        return True
-    except ImportError:
-        return False
-
-# Check if dependencies are available; offer to pip-install missing ones
-required_modules = {'numpy': 'numpy', # Import name before colon, pip installation name after colon
-                    'sklearn': 'scikit-learn',
-                    'matplotlib': 'matplotlib',
-                    'shapely': 'shapely',
-                    'scipy': 'scipy' } 
-missing_modules = [module for module in required_modules if not check_and_install_module(module)]
-if missing_modules:
-    print('Python interpreter:', sys.executable)
-    install_choice =\
-        ShowWin("Custom","Missing software",600,205,
-                "Text",         20, 48,"The following python modules weren't found on your system:",
-                "Text",         20, 73, f'{sys.executable[:65]}',
-                "Text",         20, 98, ",".join(missing_modules),
-                "Text",         20, 123,"Do you want to install these automatically?",
-                "Button",      250,155,"No",
-                "Button",      350,155,"Yes")[0]
-    
-    if install_choice == 'Yes':
-        for module in missing_modules:
-            install_name = required_modules[module]
-            subprocess.call([sys.executable, '-m', 'pip3', 'install', install_name])
-    else:
-        ShowMessage("Some python modules are missing, try installing manually. Exiting.")
-        plugin.end()
+# Verify the scientific stack is present AND functional before importing it.
+# ensure_dependencies() diagnoses the running Python (rejects YASARA's bundled
+# 'epy'), functionally probes each dependency (a bare `import matplotlib` misses
+# the tkagg/Tcl breakage), and offers a correct install/upgrade. It must run
+# BEFORE the heavy imports below, which would otherwise crash on a bad env.
+_env_status = ensure_dependencies(interactive=True)
+if _env_status != 'ok':
+    # 'repaired-restart': packages were fixed but this process still holds the
+    # old modules, so the user was asked to relaunch. 'abort': env unusable and
+    # already explained. Either way, stop before the heavy imports.
+    plugin.end()
 
 import numpy as np
 import re
