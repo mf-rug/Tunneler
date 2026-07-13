@@ -4,8 +4,16 @@
 # at, isolating YASARA's plugin python from Homebrew system-python churn (the
 # recurring source of dependency breakage, e.g. the Tcl/Tk 9 + matplotlib issue).
 #
-# Build:   python3 -m venv ~/.yasara-venv && ~/.yasara-venv/bin/pip install -r requirements.txt
+# Build:   ./setup_venv.sh              (creates the venv, installs these, AND adds
+#                                        the yasara .pth described below)
 # Point:   yasara.ini -> PythonPath /Users/<you>/.yasara-venv/bin/python
+#
+# IMPORTANT: a plain `pip install -r requirements.txt` is NOT enough. A
+# GUI-launched YASARA runs plugins in a clean environment that does NOT inherit
+# your shell's PYTHONPATH, so the venv must be told where YASARA's `yasara`
+# module lives. setup_venv.sh writes a .pth into the venv site-packages pointing
+# at /Applications/YASARA.app/Contents/yasara/pym. Without it the plugin dies
+# with "ModuleNotFoundError: No module named 'yasara'".
 #
 # Scientific stack pinned to the versions the Tunneler regression baselines were
 # generated against, so detection output stays reproducible.
