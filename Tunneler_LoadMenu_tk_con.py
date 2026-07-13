@@ -33,6 +33,16 @@ MainMenu: Analyze
 # ============================================================
 
 import sys
+import os
+
+# YASARA runs plugins from the plg/ folder (it sets the working directory there)
+# and provides the `yasara` module as plg/yasara.py. Normally sys.path[0] is the
+# script's folder (plg/), so the import just works -- but when this file is a
+# SYMLINK (e.g. a dev checkout linked into plg/), Python 3.11+ sets sys.path[0]
+# to the link *target* instead, and `import yasara` fails. Make the import robust
+# either way by putting the plugin folder (cwd) on the path first.
+if os.getcwd() not in sys.path:
+    sys.path.insert(0, os.getcwd())
 from yasara import *
 from Tunneler_env_check import ensure_dependencies
 
