@@ -18,7 +18,17 @@ YASARA_PYM="${YASARA_PYM:-/Applications/YASARA.app/Contents/yasara/pym}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Building venv at: $VENV  (base: $BASE_PY)"
-"$BASE_PY" -m venv "$VENV"
+# Clean rebuild: remove any prior venv first (safe -- this dir is a dedicated,
+# disposable venv). Guard against obviously wrong paths.
+case "$VENV" in
+  "$HOME"/.yasara-venv|"$HOME"/*venv*|/private/tmp/*|/tmp/*) rm -rf "$VENV" ;;
+  *) echo "Refusing to rm unexpected VENV path: $VENV" >&2; exit 1 ;;
+esac
+# --copies (real python binary, not a symlink): YASARA realpath-resolves the
+# PythonPath before exec, and a symlinked venv/bin/python resolves back to the
+# base interpreter -> the venv silently does NOT activate. A real copied binary
+# has nothing to resolve away, so the venv activates no matter how it's invoked.
+"$BASE_PY" -m venv --copies "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q -r "$HERE/requirements.txt"
 
