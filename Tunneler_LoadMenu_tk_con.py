@@ -639,7 +639,7 @@ def tunneler_dialog():
         Console("OFF")
         if obj == None:
             return None
-        stat = SwitchObj(obj)
+        stat = SwitchObj(obj, 'OnOff')
         bool_stat = [True if x == 'On' else False for x in stat]
         return any(bool_stat)
 

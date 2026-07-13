@@ -434,7 +434,7 @@ def point_clouder(target, ball_spacing, ignore_surface, keep_surf_points, surf_c
     ddh_points = np.unique(np.round(ddh_points, 0), axis=0)
 
     write_cif_file(ddh_points, PWD() + os.path.sep + f'{target}roughsurf.cif', ori = 'right')
-    ddh =  LoadCIF(PWD() + os.path.sep + f'{target}roughsurf.cif', center=False, correct=False)
+    ddh =  LoadCIF(PWD() + os.path.sep + f'{target}roughsurf.cif', center=False, correct=True)
     MoveObj(ddh, z=OBJECT_Z_OFFSET)  # Shift off-screen so it doesn't interfere with the main view
     StickObj(ddh)
     ColorObj(ddh, 'white')
@@ -495,12 +495,12 @@ def load_points_yasara(target, point_cloud, keep_exclusion):
     # keep excluded points at the surface as separate object
     if keep_exclusion:
         write_cif_file(point_cloud[0], PWD() + os.path.sep + f'{target}outside.cif')
-        outside_points = LoadCIF(f'{PWD()}{os.path.sep}{target}outside.cif', correct=False, center=False)[0]
+        outside_points = LoadCIF(f'{PWD()}{os.path.sep}{target}outside.cif', correct=True, center=False)[0]
         MoveObj(outside_points,z=OBJECT_Z_OFFSET)
         NameObj(outside_points, f'{target}excluded')
 
     write_cif_file(point_cloud[1], os.path.join(PWD(), f'{target}inside.cif'))
-    inside_points = LoadCIF(f'{PWD()}{os.path.sep}{target}inside.cif', correct=False, center=False)[0]
+    inside_points = LoadCIF(f'{PWD()}{os.path.sep}{target}inside.cif', correct=True, center=False)[0]
     os.remove(os.path.join(PWD(), f'{target}inside.cif'))
     MoveObj(inside_points,z=OBJECT_Z_OFFSET)
 
@@ -811,7 +811,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
     tpoints_cube_points = get_cube_points(tpoints_hull_vertices, REFINED_SURF_SPACING)
     tpoints_shape_points = get_shape_points(tpoints_cube_points, tpoints_hull_vertices)
     write_cif_file(tpoints_shape_points, PWD() + os.path.sep + f'{target}tpoints_shape_points.cif')
-    tpoints_outside_points = LoadCIF(f'{PWD()}{os.path.sep}{target}tpoints_shape_points.cif', correct=False, center=False)[0]
+    tpoints_outside_points = LoadCIF(f'{PWD()}{os.path.sep}{target}tpoints_shape_points.cif', correct=True, center=False)[0]
     MoveObj(tpoints_outside_points,z=OBJECT_Z_OFFSET)
     # Keep only points within SURFACE_REFINE_DISTANCE of the protein's accessible surface
     DelAtom(f'obj {tpoints_outside_points} with distance > {SURFACE_REFINE_DISTANCE} from accessible surface of obj {target}')
