@@ -1,0 +1,21 @@
+# Tunneler / YASARA ExternalPython dependencies.
+#
+# These are installed into a dedicated venv that yasara.ini's PythonPath points
+# at, isolating YASARA's plugin python from Homebrew system-python churn (the
+# recurring source of dependency breakage, e.g. the Tcl/Tk 9 + matplotlib issue).
+#
+# Build:   python3 -m venv ~/.yasara-venv && ~/.yasara-venv/bin/pip install -r requirements.txt
+# Point:   yasara.ini -> PythonPath /Users/<you>/.yasara-venv/bin/python
+#
+# Scientific stack pinned to the versions the Tunneler regression baselines were
+# generated against, so detection output stays reproducible.
+numpy==2.4.4
+scipy==1.17.1
+scikit-learn==1.8.0
+shapely==2.0.4
+# matplotlib must be >=3.9.2 for Tcl/Tk 9 support (older versions fail with
+# "ImportError: Failed to load Tcl_SetVar" on the tkagg backend).
+matplotlib==3.11.0
+# For the user's other ExternalPython plugins (FoldSeek, bioprodict):
+requests
+pandas
