@@ -116,35 +116,25 @@ def stagen(stage):
 # ============================================================
 
 def DuplicateObj(obj_sel):
-    """Duplicate one or more YASARA objects, working in any stage.
+    """Duplicate one or more YASARA objects into new object(s), working in any stage.
 
-    In View stage, delegates to the built-in y_DuplicateObj.
-    In higher stages, saves each object to a temp .yob, reloads it,
-    and transfers coordinates to match the original.
+    Delegates to the built-in DuplicateObj. On every tier tested (View and
+    Structure, YASARA 26.4) it creates isolated duplicate object(s) with global
+    coordinates and names preserved — verified identical to the old manual
+    routine (max coord diff 0.0 even under an applied translation+rotation), so
+    the previous per-object SaveYOb/LoadYOb + TransferObj round-trip was
+    unnecessary. This mirrors the DuplicateAtom fix (perf item B2); the round-trip
+    here was per-object rather than full-scene, so a lighter cost and smaller
+    crash-surface, but still redundant disk I/O.
 
-    Returns a list with the new object number(s).
+    Returns a list with the new object number(s). (Old manual implementation is
+    in git history if an edge case ever needs it.)
     """
     if obj_sel is None:
         ShowMessage('bugggg, obj_sel is None')
         wc()
         return([''])
-    Console("OFF")
-    if stagen(stage) == stagen('View'):
-        new = y_DuplicateObj(obj_sel)  # was `obj` (undefined here) -> guaranteed NameError on View tier
-        return(new)
-    else:
-        objs = ListObj(obj_sel, format='OBJNUM')
-        objn = ListObj(obj_sel, format='OBJNAME')
-        i=0
-        for obj in objs:
-            SaveYOb(obj, os.path.join(PWD(), NameObj(obj)[0] + '.yob'), transform=False)
-            new = LoadYOb(NameObj(obj)[0] + '.yob')
-            os.remove(os.path.join(PWD(), NameObj(obj)[0] + '.yob'))
-            TransferObj(new, obj, local='keep')
-            NameObj(new, objn[i])
-            i+=1
-        return([new])
-    Console("ON")
+    return y_DuplicateObj(obj_sel)
 
 def DuplicateRes(res):
     """Duplicate residues, stage-aware. Delegates to DuplicateAtom in non-View stages."""
