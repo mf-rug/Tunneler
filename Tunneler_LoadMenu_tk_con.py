@@ -661,14 +661,28 @@ def tunneler_dialog():
     # get previous settings
     def get_config(config_file=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tunneler_config.ini')):
         """Load tunnel parameters from the INI config file into global variables."""
+        # `global` must cover BOTH branches: the else-branch previously assigned
+        # module-local names that vanished, leaving the globals unset (NameError
+        # on a fresh install with no config yet).
+        global ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog
         if os.path.exists(config_file):
-            config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tunneler_config.ini')
             config = ConfigParser()
             config.read(config_file)
-            global ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog
-            ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog = float(config['Variables']['ignore_surface']), float(config['Variables']['ball_spacing']), float(config['Variables']['max_ball_protein']), float(config['Variables']['surf_con_prev']), bool(config['Variables']['keep_surf_points']), int(config['Variables']['mds']), float(config['Variables']['min_vol']), int(config['Variables']['connect_cut']), bool(config['Variables']['build_pol']), str(config['Variables']['prog'])
+            v = config['Variables']
+            ignore_surface = float(v['ignore_surface'])
+            ball_spacing = float(v['ball_spacing'])
+            max_ball_protein = float(v['max_ball_protein'])
+            surf_con_prev = float(v['surf_con_prev'])
+            # getboolean parses 'True'/'False' strings; plain bool('False') is
+            # always True, which silently forced these flags on.
+            keep_surf_points = config.getboolean('Variables', 'keep_surf_points')
+            mds = int(v['mds'])
+            min_vol = float(v['min_vol'])
+            connect_cut = int(v['connect_cut'])
+            build_pol = config.getboolean('Variables', 'build_pol')
+            prog = str(v['prog'])
         else:
-            ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog = 3.8, 0.33, 2.8, 2.7, False, 0, 5, 1, True, 2
+            ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog = 3.8, 0.33, 2.8, 2.7, False, 0, 5, 1, True, 'vis'
     
     get_config()
     style = ttk.Style()
@@ -851,7 +865,7 @@ def tunneler_dialog():
 
     listbox.bind('<<ListboxSelect>>', on_sel_exclude_res)
 
-    polygon_chk = tk.BooleanVar(value=True)  # Set to True for prechecked
+    polygon_chk = tk.BooleanVar(value=build_pol)  # restored from config (get_config), so the checkbox round-trips
     polygon_button = ttk.Checkbutton(tab1_mktun)
     polygon_button.configure(text='Build polygon', variable=polygon_chk)
     polygon_button.place(anchor="nw", x=200, y=175)
