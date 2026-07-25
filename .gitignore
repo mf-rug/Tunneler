@@ -12,3 +12,8 @@ state*.png
 *.pyc
 dev/
 TUNNELER_FIXES.md
+
+# crash artifacts / downloaded structures / old DuplicateAtom temp files
+errorexit.*
+*.pdb
+save_helper*
