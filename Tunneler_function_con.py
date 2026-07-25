@@ -567,8 +567,14 @@ def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_
     clustering = DBSCAN(eps=eps, min_samples=2).fit(points)
     labels = clustering.labels_
 
-    # Set the minimum number of points a cluster must have
-    min_points = min_vol / ball_spacing
+    # Set the minimum number of points a cluster must have.
+    # The cloud is a cubic grid at spacing `ball_spacing`, so it holds ~1 point
+    # per ball_spacing**3 of volume. Converting the minimum tunnel VOLUME
+    # (min_vol, in A^3) to a point count therefore divides by ball_spacing**3.
+    # (Previously this divided by ball_spacing, so min_vol was not actually a
+    # volume and the "A^3" label was wrong; this also makes the threshold a true
+    # physical volume, independent of the chosen grid spacing.)
+    min_points = min_vol / ball_spacing ** 3
 
     # Initialize an empty list for each cluster
     num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
@@ -615,7 +621,7 @@ def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_
 # ============================================================
 
 def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball_protein=2.8,
-             surf_con_prev=2.7, keep_surf_points=False, mds=0, min_vol=50, connect_cut=1, build_pol=True, prog='vis', progress_var=None,percent_label=None):
+             surf_con_prev=2.7, keep_surf_points=False, mds=0, min_vol=5, connect_cut=1, build_pol=True, prog='vis', progress_var=None,percent_label=None):
     """Run the full tunnel detection pipeline on a YASARA protein object.
 
     This is the main entry point called by the GUI. It orchestrates the entire
@@ -786,7 +792,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
         progress_var.set(80)
         percent_label.config(text=f'80%')
 
-    cluster_tunnel_points_dbscan(target, points_to_cluster, min_vol, connect_cut, ball_spacing)
+    cluster_tunnel_points_dbscan(target, points_to_cluster, min_vol, ball_spacing, connect_cut)
 
     if progress_var != None and percent_label != None:  
         progress_var.set(90)

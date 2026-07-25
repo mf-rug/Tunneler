@@ -192,7 +192,12 @@ def tunneler_dialog():
             
         get_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tunneler_config.ini'))
         points = np.array(PosAtom(f'Obj {target()}Cl???????', coordsys='global')).reshape(-1,3)
-        cluster_tunnel_points_dbscan(tar, points, min_vol, float(ball_spacing), connect_cut, recluster=True)
+        # Use the LIVE slider values for the clustering thresholds so Recluster
+        # reflects the current settings (min cluster volume + connect cutoff).
+        # ball_spacing stays the STORED value the cloud was generated with:
+        # Recluster re-thresholds the existing points, it does not regenerate them.
+        cluster_tunnel_points_dbscan(tar, points, min_vol_scale_chk.get(), float(ball_spacing),
+                                     connect_cut_scale_chk.get(), recluster=True)
         SwitchObj(f'{tar}Cl????????', "OFF")
         SwitchObj(ListObj(f'{tar}Cl???????')[:5], "ON")
         transf_and_fix_ss(tar)
@@ -663,7 +668,7 @@ def tunneler_dialog():
             global ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog
             ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog = float(config['Variables']['ignore_surface']), float(config['Variables']['ball_spacing']), float(config['Variables']['max_ball_protein']), float(config['Variables']['surf_con_prev']), bool(config['Variables']['keep_surf_points']), int(config['Variables']['mds']), float(config['Variables']['min_vol']), int(config['Variables']['connect_cut']), bool(config['Variables']['build_pol']), str(config['Variables']['prog'])
         else:
-            ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog = 3.8, 0.33, 2.8, 2.7, False, 0, 50, 1, True, 2
+            ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog = 3.8, 0.33, 2.8, 2.7, False, 0, 5, 1, True, 2
     
     get_config()
     style = ttk.Style()
@@ -716,7 +721,7 @@ def tunneler_dialog():
 
     min_vol_scale_chk = tk.DoubleVar(value=min_vol)
     min_vol_value_label = tk.Label(tab1_mktun, text=f"{min_vol_scale_chk.get():.0f}")
-    min_vol_scale = ttk.Scale(tab1_mktun, from_=0, to=1000, orient="horizontal", variable=min_vol_scale_chk,
+    min_vol_scale = ttk.Scale(tab1_mktun, from_=0, to=200, orient="horizontal", variable=min_vol_scale_chk,
                             command=lambda value, var=min_vol_scale_chk, label=min_vol_value_label: update_label(var, label, 0))
     min_vol_label = tk.Label(tab1_mktun, text=f"Minimum cluster volume (\u212B\u00b3)")
     update_label(min_vol_scale_chk, min_vol_value_label, 0)
@@ -927,7 +932,7 @@ def tunneler_dialog():
         prot_space_scale_chk.set(2.8), 
         surf_con_scale_chk.set(2.7), 
         num_md_scale_chk.set(0), 
-        min_vol_scale_chk.set(50), 
+        min_vol_scale_chk.set(5),
         connect_cut_scale_chk.set(1), 
         polygon_chk.set(True),
         show_prog_var.set('vis')
