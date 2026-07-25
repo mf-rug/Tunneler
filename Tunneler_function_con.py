@@ -156,41 +156,28 @@ def DuplicateRes(res):
 
 
 def DuplicateAtom(atm):
-    """Duplicate atoms, stage-aware.
+    """Duplicate atoms into new object(s) — one new object per source object.
 
-    In non-View stages: saves the entire scene, deletes everything except the
-    selected atoms, saves those to temp .yob files, restores the scene, then
-    reloads the saved atoms as new objects.
+    Delegates to YASARA's built-in DuplicateAtom. On every tier tested (View and
+    Structure, YASARA 26.4) the built-in already produces exactly what the old
+    manual routine did: isolated new object(s) — one per source object — with
+    global coordinates and the source object's name preserved, returned as a list
+    of new object numbers.
 
-    Returns a list of new object numbers.
+    The previous non-View branch instead saved the ENTIRE scene to disk, deleted
+    all but the selected atoms, saved the survivors per-object, reloaded the whole
+    scene, then reloaded the pieces — a full SaveSce/LoadSce round-trip on EVERY
+    call (once per tunnel cluster + once per residue companion). On large scenes
+    (e.g. 5m10, ~8 round-trips/run over thousands of point-cloud atoms) the
+    repeated full-scene serialization intermittently corrupted YASARA's heap
+    (fatal error 39, "mem_free: Pointer to free not found") and was the single
+    biggest per-run cost (perf item B2). The built-in avoids the round-trip
+    entirely. Equivalence verified: 1mbn/1cv2/5m10 cloud fingerprints unchanged.
+
+    (Old manual implementation preserved in git history if an edge case ever
+    needs it.)
     """
-    Console("OFF")
-    if stagen(stage) == stagen('View'):
-        new = y_DuplicateAtom(atm)
-        return(new)
-    else:
-        SaveSce(os.path.join(PWD(),'save_helper.sce'))
-        UnselectAll()
-        SelectAtom(atm)
-        DelAtom('!selected')
-        UnselectAll()
-        objs = ListObj('atom all', format = 'OBJNUM')
-        objn = ListObj('atom all', format = 'OBJNAME')
-        for obj in objs:
-            SaveYOb(obj, os.path.join(PWD(), 'save_helper_' + str(obj) + '.yob'), transform=False)
-        LoadSce('save_helper.sce')
-        os.remove(os.path.join(PWD(),'save_helper.sce'))
-        i=0
-        new_list = []
-        for obj in objs:
-            new = LoadYOb(os.path.join(PWD(), 'save_helper_' + str(obj) + '.yob'))
-            new_list.append(new)
-            os.remove(os.path.join(PWD(), 'save_helper_' + str(obj) + '.yob'))
-            TransferObj(new, obj, local='keep')
-            NameObj(new, objn[i])
-            i+=1
-        return(new_list)
-    Console("ON")
+    return y_DuplicateAtom(atm)
 
 def stop_plugin(message):
     """Show an error message and terminate the plugin."""
