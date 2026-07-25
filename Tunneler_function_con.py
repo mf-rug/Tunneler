@@ -311,6 +311,41 @@ def write_cif_file(points, output_file, ori='right'):
                 cif_file.write('{} {} {:8.3f} {:8.3f} {:8.3f}\n'.format(atom_labels[i], atom_symbols[i], points[i, 0], points[i, 1], points[i, 2]))
 
 
+# Loading a point cloud via a single CIF is ~O(N^2) in the number of atoms in the
+# file (YASARA's per-load neighbour/bond setup among the loaded atoms), so a
+# 400-500k-point cloud costs 20-30 s. Measured: 18k pts = 0.04 s, 400k = 18 s,
+# 496k = 28 s. The cost is per-file and independent of the existing scene (tested:
+# RemoveObj all first, and 'correct' on/off, make no difference), so splitting the
+# cloud into small files and JoinObj-ing them back collapses the one big square
+# into a sum of tiny ones (496k: 27 s -> ~1.5 s at this chunk size). Same atoms in
+# the same order -> byte-identical downstream result.
+CIF_LOAD_CHUNK = 20000
+
+def load_cif_points(points, path_base, ori='right', center=False, correct=True, chunk=CIF_LOAD_CHUNK):
+    """Write a numpy point cloud to CIF and load it into YASARA as ONE object,
+    chunking the CIF to avoid LoadCIF's O(N^2) single-file cost (see note above).
+
+    Returns [objnum] (1-element list), matching LoadCIF's return so callers can
+    index [0] or use the list directly.
+    """
+    n = len(points) if points is not None else 0
+    if n == 0:
+        # Preserve LoadCIF-of-empty behaviour for the (guarded) empty case.
+        write_cif_file(points, path_base, ori=ori)
+        res = LoadCIF(path_base, center=center, correct=correct)
+        os.remove(path_base)
+        return res
+    objs = []
+    for k, i in enumerate(range(0, n, chunk)):
+        part = '{}.part{}'.format(path_base, k)
+        write_cif_file(points[i:i + chunk], part, ori=ori)
+        objs.append(LoadCIF(part, center=center, correct=correct)[0])
+        os.remove(part)
+    if len(objs) > 1:
+        JoinObj(' '.join(str(o) for o in objs), objs[0])
+    return [objs[0]]
+
+
 def show_polygon(target, hull_vertices, hull_simplices, color='green', name='TPolygon'):
     """Render a convex hull as YASARA polygon objects and join them into one."""
     for i in range(len(hull_vertices[hull_simplices])):
@@ -410,8 +445,7 @@ def point_clouder(target, ball_spacing, ignore_surface, keep_surf_points, surf_c
     ddh_points = create_surrounding_points(pdb_points, ROUGH_SURF_SPACING)
     ddh_points = np.unique(np.round(ddh_points, 0), axis=0)
 
-    write_cif_file(ddh_points, PWD() + os.path.sep + f'{target}roughsurf.cif', ori = 'right')
-    ddh =  LoadCIF(PWD() + os.path.sep + f'{target}roughsurf.cif', center=False, correct=True)
+    ddh = load_cif_points(ddh_points, PWD() + os.path.sep + f'{target}roughsurf.cif', ori='right', center=False, correct=True)
     MoveObj(ddh, z=OBJECT_Z_OFFSET)  # Shift off-screen so it doesn't interfere with the main view
     StickObj(ddh)
     ColorObj(ddh, 'white')
@@ -471,14 +505,11 @@ def load_points_yasara(target, point_cloud, keep_exclusion):
     Console("OFF")
     # keep excluded points at the surface as separate object
     if keep_exclusion:
-        write_cif_file(point_cloud[0], PWD() + os.path.sep + f'{target}outside.cif')
-        outside_points = LoadCIF(f'{PWD()}{os.path.sep}{target}outside.cif', correct=True, center=False)[0]
+        outside_points = load_cif_points(point_cloud[0], PWD() + os.path.sep + f'{target}outside.cif', correct=True, center=False)[0]
         MoveObj(outside_points,z=OBJECT_Z_OFFSET)
         NameObj(outside_points, f'{target}excluded')
 
-    write_cif_file(point_cloud[1], os.path.join(PWD(), f'{target}inside.cif'))
-    inside_points = LoadCIF(f'{PWD()}{os.path.sep}{target}inside.cif', correct=True, center=False)[0]
-    os.remove(os.path.join(PWD(), f'{target}inside.cif'))
+    inside_points = load_cif_points(point_cloud[1], os.path.join(PWD(), f'{target}inside.cif'), correct=True, center=False)[0]
     MoveObj(inside_points,z=OBJECT_Z_OFFSET)
 
     StickObj(f'{target}inside {target}outside')
@@ -798,8 +829,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
     tpoints_hull_vertices, hull_simplices = get_hull(tpoints)
     tpoints_cube_points = get_cube_points(tpoints_hull_vertices, REFINED_SURF_SPACING)
     tpoints_shape_points = get_shape_points(tpoints_cube_points, tpoints_hull_vertices)
-    write_cif_file(tpoints_shape_points, PWD() + os.path.sep + f'{target}tpoints_shape_points.cif')
-    tpoints_outside_points = LoadCIF(f'{PWD()}{os.path.sep}{target}tpoints_shape_points.cif', correct=True, center=False)[0]
+    tpoints_outside_points = load_cif_points(tpoints_shape_points, PWD() + os.path.sep + f'{target}tpoints_shape_points.cif', correct=True, center=False)[0]
     MoveObj(tpoints_outside_points,z=OBJECT_Z_OFFSET)
     # Keep only points within SURFACE_REFINE_DISTANCE of the protein's accessible surface
     DelAtom(f'obj {tpoints_outside_points} with distance > {SURFACE_REFINE_DISTANCE} from accessible surface of obj {target}')
