@@ -239,8 +239,14 @@ def write_vertices_to_pdb(vertices, extremes, output_file, rotate=False):
                 # Rotate 180 degrees around the Y-axis
                 vertex = [-vertex[0], vertex[1], -vertex[2]]
 
+            # PDB fixed-width columns: serial is 5 chars (max 99999), resSeq 4
+            # (max 9999). Wrap both so large vertex counts don't overflow the
+            # fields and shift every subsequent column. Below the limits the
+            # output is byte-for-byte identical to before.
+            serial = i % 100000
+            resseq = i % 10000
             file.write(
-                f"ATOM  {i:5d}  Du  {residue_name} A{i:4d}    {vertex[0]:8.3f}{vertex[1]:8.3f}{vertex[2]:8.3f}  1.00 20.00\n"
+                f"ATOM  {serial:5d}  Du  {residue_name} A{resseq:4d}    {vertex[0]:8.3f}{vertex[1]:8.3f}{vertex[2]:8.3f}  1.00 20.00\n"
             )
 
 
@@ -287,13 +293,13 @@ def square_vertices(point1, point2, side_length, fraction):
     # Step 2: Compute the normal vector
     normal_vector = normalize(p2 - p1)
 
-    # Step 3: Find two perpendicular vectors in the plane
-    # Here we find one arbitrary perpendicular vector and then use the cross product to find another.
-    if (normal_vector == np.array([1, 0, 0])).all():
-        # Special case to handle collinearity
-        perp_vector1 = np.array([0, 1, 0])
-    else:
-        perp_vector1 = normalize(np.cross(normal_vector, np.array([1, 0, 0])))
+    # Step 3: Find two perpendicular vectors in the plane.
+    # Cross the normal with whichever cardinal axis it is *least* aligned with,
+    # so the cross product is never near-zero. The old code only guarded the
+    # +X case, so an axis pointing along -X (or ±Y/±Z) produced a zero-length
+    # perp_vector1 and a degenerate, zero-area cutting square.
+    ref = np.eye(3)[np.argmin(np.abs(normal_vector))]
+    perp_vector1 = normalize(np.cross(normal_vector, ref))
     perp_vector2 = np.cross(normal_vector, perp_vector1)
 
     # Step 4: Scale the perpendicular vectors to the half side length
@@ -412,9 +418,37 @@ def calculate_area_of_points(points, grid_spacing, radius=False):
 def find_maximum_inscribed_circle(polygon):
     """
     Find the maximum inscribed circle within a given polygon.
-    
-    :param polygon: Shapely Polygon object.
+
+    Accepts either a Shapely Polygon or a MultiPolygon. A merged cross-section
+    (``unary_union`` of point-buffers) is a MultiPolygon whenever it splits into
+    disconnected lobes; the old code assumed a single Polygon and crashed on
+    ``.exterior`` for those slices. For a MultiPolygon we evaluate every
+    component and return the largest inscribed circle found across all of them.
+    The single-Polygon result is unchanged.
+
+    :param polygon: Shapely Polygon or MultiPolygon object.
     :return: Tuple containing the center and radius of the largest inscribed circle.
+    """
+    if isinstance(polygon, MultiPolygon):
+        parts = [g for g in polygon.geoms if not g.is_empty and g.area > 0]
+    else:
+        parts = [polygon]
+
+    best_center = None
+    best_radius = 0
+    for part in parts:
+        center, radius = _max_inscribed_circle_single(part)
+        if radius > best_radius:
+            best_radius = radius
+            best_center = center
+    return best_center, best_radius
+
+
+def _max_inscribed_circle_single(polygon):
+    """Maximum inscribed circle of a single Shapely Polygon (Voronoi method).
+
+    This is the original ``find_maximum_inscribed_circle`` body, unchanged, so
+    the numeric result for a plain Polygon is identical to before.
     """
     points = np.array(polygon.exterior.coords)
     vor = Voronoi(points)
