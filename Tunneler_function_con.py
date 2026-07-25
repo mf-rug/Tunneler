@@ -130,7 +130,7 @@ def DuplicateObj(obj_sel):
         return([''])
     Console("OFF")
     if stagen(stage) == stagen('View'):
-        new = y_DuplicateObj(obj)
+        new = y_DuplicateObj(obj_sel)  # was `obj` (undefined here) -> guaranteed NameError on View tier
         return(new)
     else:
         objs = ListObj(obj_sel, format='OBJNUM')
@@ -648,6 +648,11 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
         progress_var: Optional tkinter IntVar for progress bar updates.
         percent_label: Optional tkinter Label for percentage display.
     """
+    # Publish the chosen progress mode to the module global that w() reads.
+    # (Can't use `global prog` here: `prog` is also a parameter name, so we set
+    # the module global explicitly. Without this the GUI's fast/vis/wait choice
+    # was ignored and w() always fell back to its 'vis' default.)
+    globals()['prog'] = prog
     Console("OFF")
     Print('------------------------------------------------------------------------------------')
     Print('|                                -----------.                                ')
