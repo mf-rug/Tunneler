@@ -11,3 +11,4 @@ Tunneler_config.ini
 state*.png
 *.pyc
 dev/
+TUNNELER_FIXES.md
