@@ -317,9 +317,14 @@ def write_cif_file(points, output_file, ori='right'):
 # 496k = 28 s. The cost is per-file and independent of the existing scene (tested:
 # RemoveObj all first, and 'correct' on/off, make no difference), so splitting the
 # cloud into small files and JoinObj-ing them back collapses the one big square
-# into a sum of tiny ones (496k: 27 s -> ~1.5 s at this chunk size). Same atoms in
-# the same order -> byte-identical downstream result.
-CIF_LOAD_CHUNK = 20000
+# into a sum of tiny ones. Same atoms in the same order -> byte-identical result.
+#
+# Chunk size swept on the 496k worst case (write+load+join, real helper): the
+# wall-clock is a flat U with its minimum across ~12k-20k (496k: single-file
+# 29.7 s -> 2.4 s, ~12x). 15k is the measured optimum and is also cheap for the
+# small roughsurf cloud (54k -> ~0.17 s). Too small (<=5k) adds per-file overhead;
+# too large (>=50k) re-grows the per-file square.
+CIF_LOAD_CHUNK = 15000
 
 def load_cif_points(points, path_base, ori='right', center=False, correct=True, chunk=CIF_LOAD_CHUNK):
     """Write a numpy point cloud to CIF and load it into YASARA as ONE object,
