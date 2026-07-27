@@ -204,6 +204,8 @@ def tunneler_dialog():
         transf_and_fix_ss(tar)
         DelObj('???_sphere ???_shape')
         PairObj(tar, 'dist_sel', '')
+        # Recluster changed the cluster set -> refresh the slider's precomputed distances.
+        _precompute_surf_dist(tar)
         HideMessage()
         Wait(1)
         Console("hidden")
@@ -926,6 +928,9 @@ def tunneler_dialog():
             for x in ListObj(f'{target()}Cl???????', format='OBJNUM: OBJNAME'):
                 tnl_insp_options_list.append(x)
             update_option_menu(tab3_inspect, tnl_insp_option, tnl_insp_options_list, current_value='All')
+            # Precompute surface-point distances now (cheap KDTree) so the
+            # Surface-points slider in the Appearance tab is instant from the first drag.
+            _precompute_surf_dist(target())
         initializing = False
         Wait(1)
         Console("hidden")
@@ -1142,20 +1147,49 @@ def tunneler_dialog():
 
 
     # target -> (n_cluster_atoms, min_dist, max_dist). The per-atom distance itself
-    # lives in each cluster atom's Property field (see ml_outside_points). Cached so
-    # the expensive precompute runs once per cluster set, not on every slider tick.
+    # lives in each cluster atom's Property field. Cached so the precompute runs
+    # once per cluster set. Cheap enough (KDTree) to run eagerly at the end of
+    # detection/recluster (see _precompute_surf_dist calls) so the slider is instant
+    # from the very first drag.
     surf_dist_cache = {}
+
+    def _precompute_surf_dist(tar):
+        """Precompute each cluster atom's distance to the roughsurf point cloud
+        (KDTree, global coords) and store it bucketed in the atom Property field, so
+        the Surface-points slider becomes a pure 'Property<threshold' hide with no
+        per-move surface recompute. No-op if already done for the current cluster
+        set. Does not change what is visible; only populates the Property field."""
+        n_cl = CountAtom(f'obj {tar}Cl???????')
+        cache = surf_dist_cache.get(tar)
+        if n_cl == 0 or (cache is not None and cache[0] == n_cl):
+            return
+        Console("OFF")
+        SupAtom(f'obj {tar}roughsurf', f'obj {tar}', match='Yes')
+        rs_du = DuplicateObj(f'{tar}roughsurf')[0]
+        DelAtom(f'obj {rs_du} element !Du')
+        rs_pos = np.array(PosAtom(f'obj {rs_du} element Du', coordsys='global')).reshape(-1, 3)
+        DelObj(rs_du)
+        cl = np.array(ListAtom(f'obj {tar}Cl???????'))
+        cl_pos = np.array(PosAtom(f'obj {tar}Cl???????', coordsys='global')).reshape(-1, 3)
+        if len(cl) == 0 or len(rs_pos) == 0:
+            return
+        dist = cKDTree(rs_pos).query(cl_pos)[0]
+        # Store distance (bucketed to 0.1 A) per atom: one grouped PropAtom per
+        # bucket (~200 calls, independent of atom count; PropAtom takes a single
+        # value, so a per-atom list can't be set at once).
+        PropAtom(f'obj {tar}Cl???????', 99999)
+        dr = np.round(dist, 1)
+        for v in np.unique(dr):
+            PropAtom('atom ' + ' '.join(map(str, cl[dr == v])), float(v))
+        surf_dist_cache[tar] = (n_cl, float(dist.min()), float(dist.max()))
 
     def ml_outside_points(by=25.5):
         """Hide tunnel points near the protein surface (the 'Surface points' slider callback).
 
-        Each cluster atom's distance to the roughsurf point cloud is precomputed
-        once with a KDTree and stored in the atom Property field, so moving the
-        slider is just a fast 'Property<threshold' hide -- no per-move surface
-        recompute (previously every tick duplicated the ~18k-atom roughsurf and
-        recomputed the accessible surface, and the first touch ran a slow
-        surface-distance scan loop). The precompute is redone only when the cluster
-        set changes (new detection / recluster), detected via the cluster atom count.
+        Distances are precomputed into the atom Property field (see
+        _precompute_surf_dist, run eagerly after detection/recluster), so moving the
+        slider is just a fast 'Property<threshold' hide. Falls back to precomputing
+        on demand if it has not run yet for this cluster set.
         """
         Console("OFF")
         tar = target()
@@ -1163,33 +1197,11 @@ def tunneler_dialog():
         if radio_var.get() == 'spheres':
             radio_var.set('balls')
             Balls()
-
-        n_cl = CountAtom(f'obj {tar}Cl???????')
+        _precompute_surf_dist(tar)
         cache = surf_dist_cache.get(tar)
-        if cache is None or cache[0] != n_cl:
-            # Precompute per-atom distance to the (Du-only) roughsurf point cloud.
-            SupAtom(f'obj {tar}roughsurf', f'obj {tar}', match='Yes')
-            rs_du = DuplicateObj(f'{tar}roughsurf')[0]
-            DelAtom(f'obj {rs_du} element !Du')
-            rs_pos = np.array(PosAtom(f'obj {rs_du} element Du', coordsys='global')).reshape(-1, 3)
-            DelObj(rs_du)
-            cl = np.array(ListAtom(f'obj {tar}Cl???????'))
-            cl_pos = np.array(PosAtom(f'obj {tar}Cl???????', coordsys='global')).reshape(-1, 3)
-            if len(cl) == 0 or len(rs_pos) == 0:
-                Wait(1); Console("hidden"); return
-            dist = cKDTree(rs_pos).query(cl_pos)[0]
-            # Store distance (bucketed to 0.1 A) in each atom's Property field: one
-            # grouped PropAtom per bucket (~200 calls, independent of atom count;
-            # PropAtom takes a single value, so we can't set a per-atom list at once).
-            PropAtom(f'obj {tar}Cl???????', 99999)
-            dr = np.round(dist, 1)
-            for v in np.unique(dr):
-                PropAtom('atom ' + ' '.join(map(str, cl[dr == v])), float(v))
-            min_dist, max_dist = float(dist.min()), float(dist.max())
-            surf_dist_cache[tar] = (n_cl, min_dist, max_dist)
-        else:
-            _, min_dist, max_dist = cache
-
+        if cache is None:
+            Wait(1); Console("hidden"); return
+        _, min_dist, max_dist = cache
         cur_dist = min_dist + (max_dist - min_dist) * surf_pts_chk.get()
         ShowAtom(f'obj {tar}Cl???????')
         HideAtom(f'obj {tar}Cl??????? and Property<{cur_dist:.3f}')
