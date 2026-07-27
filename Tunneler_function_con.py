@@ -319,21 +319,34 @@ def write_cif_file(points, output_file, ori='right'):
 # cloud into small files and JoinObj-ing them back collapses the one big square
 # into a sum of tiny ones. Same atoms in the same order -> byte-identical result.
 #
-# Chunk size swept on the 496k worst case (write+load+join, real helper): the
-# wall-clock is a flat U with its minimum across ~12k-20k (496k: single-file
-# 29.7 s -> 2.4 s, ~12x). 15k is the measured optimum and is also cheap for the
-# small roughsurf cloud (54k -> ~0.17 s). Too small (<=5k) adds per-file overhead;
-# too large (>=50k) re-grows the per-file square.
-CIF_LOAD_CHUNK = 15000
+# Optimal chunk size grows ~ sqrt(N): the per-file O(M^2) term favours small chunks
+# M, but per-chunk fixed overhead (write + LoadCIF setup + a JoinObj over N/M
+# objects) favours large ones, and the balance sits at M* ~ sqrt(N). Measured under
+# Console OFF (write+load+join, real helper): 200k -> ~7k (0.66 s), 496k -> ~11k
+# (2.0 s, 15x vs 30 s single-file), 5M -> ~30k (51 s vs an estimated ~40 min
+# single-file). Fitted M* ~= 17*sqrt(N), clamped so tiny clouds don't over-chunk
+# and huge ones don't regrow the per-file square.
+CIF_CHUNK_COEF, CIF_CHUNK_MIN, CIF_CHUNK_MAX = 17, 5000, 50000
 
-def load_cif_points(points, path_base, ori='right', center=False, correct=True, chunk=CIF_LOAD_CHUNK):
+def _adaptive_chunk(n):
+    return int(min(CIF_CHUNK_MAX, max(CIF_CHUNK_MIN, round(CIF_CHUNK_COEF * n ** 0.5))))
+
+def load_cif_points(points, path_base, ori='right', center=False, correct=True, chunk=None):
     """Write a numpy point cloud to CIF and load it into YASARA as ONE object,
     chunking the CIF to avoid LoadCIF's O(N^2) single-file cost (see note above).
+    `chunk=None` (default) auto-sizes the chunk to ~17*sqrt(N).
 
     Returns [objnum] (1-element list), matching LoadCIF's return so callers can
     index [0] or use the list directly.
     """
     n = len(points) if points is not None else 0
+    if chunk is None:
+        chunk = _adaptive_chunk(n)
+    # Suppress the display while we create the transient chunk objects: otherwise
+    # YASARA renders each chunk as it loads (~16% slower here, and much worse at
+    # high chunk counts). The plugin already runs Console('OFF') throughout, so
+    # this is a no-op in-plugin and a safety net if called standalone.
+    Console("OFF")
     if n == 0:
         # Preserve LoadCIF-of-empty behaviour for the (guarded) empty case.
         write_cif_file(points, path_base, ori=ori)
