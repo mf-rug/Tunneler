@@ -482,7 +482,15 @@ def tunneler_dialog():
         else:
             atms = SelectDistAtom(win=False)
         dist_col = PairObj(tar, 'dist_col')
-        if dist_col != [] and dist_sel == dist_col:
+        # The cached colours depend not only on the reference atom but also on the
+        # scaling mode ('calc per tunnel' vs global) and the colour range. Key the
+        # cache on all of them: otherwise toggling 'calc per tunnel' (or changing the
+        # colours) silently reuses the stale colouring instead of recomputing.
+        per_tunnel = pertun_chk.get()
+        min_color = color1_entry.get()
+        max_color = color2_entry.get()
+        cur_sig = f'{int(per_tunnel)}|{min_color}|{max_color}'
+        if dist_col != [] and dist_sel == dist_col and PairObj(tar, 'dist_sig') == [cur_sig]:
             atomlist = ListAtom(f'obj {tar}Cl???????')
             collist = [x[1:] for x in SegAtom(f'obj {tar}Cl???????')]
             group_and_color(atomlist, collist)
@@ -503,9 +511,6 @@ def tunneler_dialog():
         ShowMessage('Coloring by distance')
         Wait(1)
         start_time = time.perf_counter()
-        min_color = color1_entry.get()
-        max_color = color2_entry.get()
-        per_tunnel = pertun_chk.get()
         from collections import defaultdict
 
         if len(atms) > 1:
@@ -606,6 +611,7 @@ def tunneler_dialog():
             PairObj(tar, save_pairs[i], save_pairs[i + 1])
 
         PairObj(tar, 'dist_col', dist_sel[0])
+        PairObj(tar, 'dist_sig', cur_sig)
         HideMessage()
         DelObj('CenterHlp')
         Wait(1)
