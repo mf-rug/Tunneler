@@ -509,7 +509,10 @@ def point_clouder(target, ball_spacing, ignore_surface, keep_surf_points, surf_c
     else:
         outer_points = None
 
-    w('|   Calculated convex hull and filled it with points. Loading points in Yasara.')
+    # Same count the "Loaded N points" message reports after loading: inside
+    # (shape_points) plus, when kept, the outer shell (outer_points).
+    n_load = len(shape_points) + (len(outer_points) if outer_points is not None else 0)
+    w(f'|   Calculated convex hull and filled it with points. Loading {n_load:,} points in Yasara.')
     return([outer_points, shape_points])
 
 
