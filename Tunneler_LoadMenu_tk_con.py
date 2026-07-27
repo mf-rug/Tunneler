@@ -84,6 +84,7 @@ if _env_status != 'ok':
     plugin.end()
 
 import numpy as np
+from scipy.spatial import cKDTree
 import re
 import os
 from configparser import ConfigParser
@@ -1140,60 +1141,58 @@ def tunneler_dialog():
     shape_alpha_chk.set(80)
 
 
+    # target -> (n_cluster_atoms, min_dist, max_dist). The per-atom distance itself
+    # lives in each cluster atom's Property field (see ml_outside_points). Cached so
+    # the expensive precompute runs once per cluster set, not on every slider tick.
+    surf_dist_cache = {}
+
     def ml_outside_points(by=25.5):
         """Hide tunnel points near the protein surface (the 'Surface points' slider callback).
 
-        Uses the roughsurf object to determine the accessible surface, then hides
-        tunnel points closer than a distance threshold controlled by surf_pts_chk.
+        Each cluster atom's distance to the roughsurf point cloud is precomputed
+        once with a KDTree and stored in the atom Property field, so moving the
+        slider is just a fast 'Property<threshold' hide -- no per-move surface
+        recompute (previously every tick duplicated the ~18k-atom roughsurf and
+        recomputed the accessible surface, and the first touch ran a slow
+        surface-distance scan loop). The precompute is redone only when the cluster
+        set changes (new detection / recluster), detected via the cluster atom count.
         """
         Console("OFF")
         tar = target()
-        SupAtom(f'obj {tar}roughsurf', f'obj {tar}', match='Yes')
         SwitchObj('???_spheres ???_shape', 'OFF')
         if radio_var.get() == 'spheres':
             radio_var.set('balls')
             Balls()
-        rough_surf_Du = DuplicateObj(f'{tar}roughsurf')[0]
-        DelAtom(f'obj {rough_surf_Du} element !Du')
 
-        rough_surf = ListAtom(f'obj {rough_surf_Du} element Du')
-        if stagen(stage) > stagen('View'):
-            surf_atom = FirstSurfAtom(rough_surf, 'accessible')[0]
+        n_cl = CountAtom(f'obj {tar}Cl???????')
+        cache = surf_dist_cache.get(tar)
+        if cache is None or cache[0] != n_cl:
+            # Precompute per-atom distance to the (Du-only) roughsurf point cloud.
+            SupAtom(f'obj {tar}roughsurf', f'obj {tar}', match='Yes')
+            rs_du = DuplicateObj(f'{tar}roughsurf')[0]
+            DelAtom(f'obj {rs_du} element !Du')
+            rs_pos = np.array(PosAtom(f'obj {rs_du} element Du', coordsys='global')).reshape(-1, 3)
+            DelObj(rs_du)
+            cl = np.array(ListAtom(f'obj {tar}Cl???????'))
+            cl_pos = np.array(PosAtom(f'obj {tar}Cl???????', coordsys='global')).reshape(-1, 3)
+            if len(cl) == 0 or len(rs_pos) == 0:
+                Wait(1); Console("hidden"); return
+            dist = cKDTree(rs_pos).query(cl_pos)[0]
+            # Store distance (bucketed to 0.1 A) in each atom's Property field: one
+            # grouped PropAtom per bucket (~200 calls, independent of atom count;
+            # PropAtom takes a single value, so we can't set a per-atom list at once).
+            PropAtom(f'obj {tar}Cl???????', 99999)
+            dr = np.round(dist, 1)
+            for v in np.unique(dr):
+                PropAtom('atom ' + ' '.join(map(str, cl[dr == v])), float(v))
+            min_dist, max_dist = float(dist.min()), float(dist.max())
+            surf_dist_cache[tar] = (n_cl, min_dist, max_dist)
         else:
-            surf_atom = ListAtom(f'obj {rough_surf_Du} element Du with maximum distance from obj {tar}')
-            print('Warning: this command might give unexpected results because you are using the free version of Yasara.')
- 
-        min_dist = PairObj(f'{tar}roughsurf', key = 'min_dist')
-        max_dist = PairObj(f'{tar}roughsurf', key = 'max_dist')
-        if min_dist == [] or max_dist == [] or not is_float(min_dist[0]) or not is_float(max_dist[0]) :
-            disto = ListAtom(f'obj {tar}Cl??????? with minimum distance from obj {rough_surf_Du}')[0]
-            TransferObj(f'{rough_surf_Du}', ListObj(f'atom {disto}'), 'fix')
-            min_dist = float(Distance(disto, ListAtom(f'obj {rough_surf_Du} element Du with minimum distance from atom {disto}'))[0] + 2.2)
-            ShowMessage('Getting min and max distance, this may take a while')
-            Wait(1)
-            i = 1
-            total_atm_count = CountAtom(f'obj {tar}Cl???????')
-            while True:
-                count_atms = len(ListAtom(f'obj {tar}Cl??????? with distance < {i} from accessible surface touched by {surf_atom}'))
-                ShowMessage(f'Checking min and max distance, now checking: {i} atom count: {count_atms}/{total_atm_count}')
-                if count_atms != 0 and count_atms == total_atm_count:
-                    max_dist = float(i -2)
-                    break
-                else:
-                    i += 2
-                Wait(1)
-
-            PairObj(f'{tar}roughsurf', 'min_dist', f'{min_dist:.2f}')
-            PairObj(f'{tar}roughsurf', 'max_dist', f'{max_dist:.2f}')
-        else:
-            min_dist = float(min_dist[0])
-            max_dist = float(max_dist[0])
+            _, min_dist, max_dist = cache
 
         cur_dist = min_dist + (max_dist - min_dist) * surf_pts_chk.get()
-
-        ShowObj(f'obj {tar}Cl???????')
-        HideAtom(f'obj {tar}Cl??????? with distance < {cur_dist:.1f} from accessible surface touched by {surf_atom}')
-        DelObj(rough_surf_Du)
+        ShowAtom(f'obj {tar}Cl???????')
+        HideAtom(f'obj {tar}Cl??????? and Property<{cur_dist:.3f}')
         Wait(1)
         Console("hidden")
 
