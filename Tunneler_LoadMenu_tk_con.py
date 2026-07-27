@@ -1514,12 +1514,29 @@ def tunneler_dialog():
     button18.place(anchor="nw", x=165, y=155)
 
     pertun_chk = tk.BooleanVar()  # Variable to track the checkbox status
+    _pertun_busy = {'v': False}
     def on_pertun_toggle():
         # Recolour immediately when the scaling mode is toggled, but only while we
         # are already colouring by distance with a chosen reference -- never pop the
         # atom picker just because this flag changed.
-        if radio_col_var.get() == 'distance' and PairObj(target(), 'dist_sel') != []:
-            Colorbytunneldist(prompt_if_unset=False)
+        if radio_col_var.get() != 'distance' or PairObj(target(), 'dist_sel') == []:
+            return
+        # Colorbytunneldist pumps the event loop via its Wait(1) calls, so a rapid
+        # second click can re-enter this handler mid-recolour and corrupt the cached
+        # pairs. Guard against re-entrancy, and loop until the applied scaling matches
+        # the checkbox's final state (the box's variable is toggled by tk before the
+        # command fires, so a click parked behind the guard is still reflected here).
+        if _pertun_busy['v']:
+            return
+        _pertun_busy['v'] = True
+        try:
+            want, guard = None, 0
+            while want != pertun_chk.get() and guard < 20:
+                want = pertun_chk.get()
+                Colorbytunneldist(prompt_if_unset=False)
+                guard += 1
+        finally:
+            _pertun_busy['v'] = False
     checkbutton7 = ttk.Checkbutton(tab2_appear)
     checkbutton7.configure(text='calc per tunnel', variable=pertun_chk, command=on_pertun_toggle)
     checkbutton7.place(anchor="nw", x=90, y=182)
