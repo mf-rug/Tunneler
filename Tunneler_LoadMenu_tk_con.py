@@ -66,11 +66,6 @@ def rescale_floats_to_range(float_list, min_int, max_int, min_float=None, max_fl
     scaled_list = [int((x - min_float) / (max_float - min_float) * (max_int - min_int) + min_int) for x in float_list]
     return scaled_list
 
-def chunks(lst, n):
-    """Yield successive length-*n* slices of *lst* (used to batch coloring work)."""
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
 # Verify the scientific stack is present AND functional before importing it.
 # ensure_dependencies() diagnoses the running Python (rejects YASARA's bundled
 # 'epy'), functionally probes each dependency (a bare `import matplotlib` misses
@@ -510,8 +505,8 @@ def tunneler_dialog():
         start_time = time.perf_counter()
         min_color = color1_entry.get()
         max_color = color2_entry.get()
-        fast_mode = fast_chk.get()
         per_tunnel = pertun_chk.get()
+        from collections import defaultdict
 
         if len(atms) > 1:
             ShowMessage('Creating center helper object')
@@ -547,11 +542,6 @@ def tunneler_dialog():
             DelAtom(f'Obj {atm_obj} element Du')
 
         dist_target = ListObj(f'atom {center}', format='OBJNUM')[0]
-        atm_count = CountAtom(f"obj {target()}Cl???????")
-        if atm_count < 5000:
-            chunk_len = int(atm_count / 10)
-        else:
-            chunk_len = 5000
         for tunnel in objs:
             tname = ListObj(tunnel, format='OBJNAME')[0]
 
@@ -588,21 +578,20 @@ def tunneler_dialog():
             
             all_cols = rescale_floats_to_range(disto, int(min_color), int(max_color), mind, maxd)
             
-            if fast_mode:
-                jmp=max(1, int(len(atomlist) / 100))
-                atomlist = [x for _, x in sorted(zip(disto, atomlist))]
-                all_cols = [x for _, x in sorted(zip(disto, all_cols))]
-                disto = sorted(disto)
-                for i, chunk in enumerate(list(chunks(atomlist, chunk_len))):
-                    ShowMessage(f'Obj {tunnel}: Colored {i * chunk_len:,} / {len(atomlist):,} points.')
-                    Wait(1)
-                    for j in range(0, len(chunk), jmp):
-                        ColorAtom(atomlist[(i * chunk_len) + j:(i * chunk_len) + j + jmp], 
-                                all_cols[(i * chunk_len) + j])
-                        SegAtom(atomlist[(i * chunk_len) + j:(i * chunk_len) + j + jmp], f'c{all_cols[(i * chunk_len) + j]}')
-            else:
-                for i in range(len(atomlist)):
-                    ColorAtom(atomlist[i], int(all_cols[i]))
+            # Group atoms by their integer colour and issue one ColorAtom + one
+            # SegAtom per colour instead of per atom. Exact (every atom keeps its own
+            # all_cols[i]) and effectively flat in atom count: per-atom ColorAtom
+            # degrades superlinearly on large tunnels because each single-atom
+            # selection is re-resolved against the whole object (~558s vs ~0.4s at
+            # 488k points). The SegAtom stores the colour so an unchanged reference
+            # is reused via the cache path at the top of this function.
+            grouped = defaultdict(list)
+            for atom, col in zip(atomlist, all_cols):
+                grouped[int(col)].append(atom)
+            for col, atoms in grouped.items():
+                sel = " ".join(str(x) for x in atoms)
+                ColorAtom(sel, col)
+                SegAtom(sel, f'c{col}')
 
         if ListObj('???_shape') != []:
             atomlist = ListAtom(f'obj ???_shape')
@@ -1509,15 +1498,10 @@ def tunneler_dialog():
     button18.configure(text='select', command=on_colbydist)
     button18.place(anchor="nw", x=165, y=155)
 
-    fast_chk = tk.BooleanVar(value=True)  # Variable to track the checkbox status
-    checkbutton7 = ttk.Checkbutton(tab2_appear)
-    checkbutton7.configure(text='fast mode', variable=fast_chk)
-    checkbutton7.place(anchor="nw", x=90, y=182)
-
     pertun_chk = tk.BooleanVar()  # Variable to track the checkbox status
     checkbutton7 = ttk.Checkbutton(tab2_appear)
     checkbutton7.configure(text='calc per tunnel', variable=pertun_chk)
-    checkbutton7.place(anchor="nw", x=183, y=182)
+    checkbutton7.place(anchor="nw", x=90, y=182)
 
     def choose_color():
         Console("OFF")
