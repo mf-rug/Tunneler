@@ -675,7 +675,12 @@ def tunneler_dialog():
         Console("OFF")
         if obj == None:
             return None
-        stat = SwitchObj(obj, 'OnOff')
+        # Query the visibility with NO visibility argument -- SwitchObj(sel) just
+        # returns the ['On'/'Off', ...] states. Do NOT pass 'OnOff': that is not a
+        # query, it tells YASARA to step through the objects switching them on and off
+        # sequentially as a never-ending animation, which keeps running even after the
+        # plugin window is closed (it is a YASARA-side animation, not plugin code).
+        stat = SwitchObj(obj)
         bool_stat = [True if x == 'On' else False for x in stat]
         return any(bool_stat)
 
