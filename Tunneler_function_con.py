@@ -26,7 +26,7 @@ from yasara import DuplicateAtom as y_DuplicateAtom
 import itertools
 from configparser import ConfigParser
 import numpy as np
-from scipy.spatial import ConvexHull, Delaunay
+from scipy.spatial import ConvexHull, Delaunay, cKDTree
 from sklearn.cluster import DBSCAN
 
 # ============================================================
@@ -39,6 +39,7 @@ REFINED_SURF_SPACING = 0.6      # Angstroms — grid spacing for the refined sur
 SURFACE_REFINE_DISTANCE = 2.5   # Angstroms — max distance from accessible surface for refined points
 SURFACE_CONNECT_DISTANCE = 2.0  # Angstroms — flood-fill connectivity distance for surface shell
 SURFACE_BUFFER = 2.2            # Angstroms — buffer added when initializing surface distance threshold
+CIF_PREFILTER_MARGIN = 0.5     # Angstroms — over-inclusion margin for the interior-point prefilter (see _prefilter_inside_points)
 NEARBY_RESIDUE_DISTANCE = 4     # Angstroms — how close a residue must be to a tunnel to be included
 DBSCAN_EPS_FACTOR = 1.01        # Small factor to slightly enlarge DBSCAN epsilon
 
@@ -441,7 +442,42 @@ def create_surrounding_points(points, spacing, remove_edge=True):
 #     →  cluster_tunnel_points_dbscan  →  (called from Tunneler)
 # ============================================================
 
-def point_clouder(target, ball_spacing, ignore_surface, keep_surf_points, surf_con_prev, build_polygon=False):
+def _prefilter_inside_points(target, points, max_dist, ignore_res, margin=CIF_PREFILTER_MARGIN):
+    """Drop interior grid points that generate_tunnel_points would delete anyway,
+    BEFORE they are written to CIF and loaded (the dominant cost at dense ball_spacing).
+
+    The trim in generate_tunnel_points deletes grid points closer than `max_dist` to a
+    reference protein atom (a plain centre-to-centre distance test). We reproduce that
+    distance with a scipy cKDTree over the numpy array and drop only points strictly
+    closer than (max_dist - margin). This is a conservative SUPERSET filter: every point
+    that could survive the real YASARA trim (dist >= max_dist) is kept, plus a thin margin
+    shell. The existing DelAtom then makes the exact cut on the loaded object, so the final
+    tunnel-point set — and its order — is byte-identical to before; we've only avoided
+    shipping ~90%+ of the cloud (the deep interior) through the CIF round-trip.
+
+    The reference atom set matches the DelAtom's: all protein atoms MINUS the ignored
+    residues, so points near an ignored ligand stay (a tunnel may pass where it sits).
+
+    ONLY valid when the protein conformation is fixed (mds == 0). In MD mode the cloud is
+    reused across frames while the protein moves, so a frame-0 prefilter would wrongly drop
+    points that open up later — the caller gates on this.
+    """
+    if len(points) == 0:
+        return points
+    if ignore_res == [0] or ignore_res == [] or ignore_res is None:
+        ref_sel = f'obj {target}'
+    else:
+        keep = ListRes(f'obj {target} res !' + " and !".join(ignore_res))
+        ref_sel = f'obj {target} ' + " ".join(keep)
+    ref = np.array(PosAtom(ref_sel, coordsys='global')).reshape(-1, 3)
+    if len(ref) == 0:
+        return points
+    dist, _ = cKDTree(ref).query(np.asarray(points)[:, :3])
+    return points[dist >= (max_dist - margin)]
+
+
+def point_clouder(target, ball_spacing, ignore_surface, keep_surf_points, surf_con_prev, build_polygon=False,
+                  prefilter_dist=None, ignore_res=None):
     """Build a point cloud that fills the interior of the protein.
 
     Steps:
@@ -508,6 +544,12 @@ def point_clouder(target, ball_spacing, ignore_surface, keep_surf_points, surf_c
 
     else:
         outer_points = None
+
+    # Drop the deep-interior points now (they'd be deleted by generate_tunnel_points'
+    # distance-to-protein trim anyway) so we don't pay the CIF round-trip on them. Only
+    # when the protein conformation is fixed (mds == 0); the caller passes prefilter_dist.
+    if prefilter_dist is not None:
+        shape_points = _prefilter_inside_points(target, shape_points, prefilter_dist, ignore_res)
 
     # Same count the "Loaded N points" message reports after loading: inside
     # (shape_points) plus, when kept, the outer shell (outer_points).
@@ -748,7 +790,8 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
         progress_var.set(3)
         percent_label.config(text=f'3%')
 
-    point_cloud = point_clouder(target, ball_spacing=ball_spacing, ignore_surface=ignore_surface, keep_surf_points=keep_surf_points, surf_con_prev=surf_con_prev, build_polygon=build_pol)
+    point_cloud = point_clouder(target, ball_spacing=ball_spacing, ignore_surface=ignore_surface, keep_surf_points=keep_surf_points, surf_con_prev=surf_con_prev, build_polygon=build_pol,
+                                prefilter_dist=(max_ball_protein if mds == 0 else None), ignore_res=ignore_res)
 
     if progress_var != None and percent_label != None:
         progress_var.set(10)
