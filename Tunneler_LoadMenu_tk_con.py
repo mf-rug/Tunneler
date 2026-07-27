@@ -477,7 +477,6 @@ def tunneler_dialog():
         """
         Console("OFF")
         tar = target()
-        save_pairs = PairObj(tar)
         objs = [str(x) for x in ListObj(f'{target()}Cl???????')]
 
         # if the distance center is the same as before, we can reuse the color stored in SegAtom
@@ -490,6 +489,13 @@ def tunneler_dialog():
             dist_sel = PairObj(tar, 'dist_sel')
         else:
             atms = SelectDistAtom(win=False)
+        # Capture the object's key-value pairs AFTER the reference atom is picked, so a
+        # freshly-selected dist_sel is included. The recompute 'dance' below (JoinObj/
+        # DelObj on the target object) wipes the object's pairs and the restore at the
+        # end re-adds save_pairs; capturing before selection lost a just-picked dist_sel
+        # (the radiobutton first-time path), so the next 'calc per tunnel' toggle saw no
+        # selection and silently did nothing.
+        save_pairs = PairObj(tar)
         dist_col = PairObj(tar, 'dist_col')
         # The cached colours depend not only on the reference atom but also on the
         # scaling mode ('calc per tunnel' vs global) and the colour range. Key the
