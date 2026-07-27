@@ -467,8 +467,14 @@ def tunneler_dialog():
             ColorAtom(" ".join(str(x) for x in atoms), col)
 
           
-    def Colorbytunneldist(shapes=True):
-        """Color tunnel points by their distance to a user-selected reference atom/center."""
+    def Colorbytunneldist(shapes=True, prompt_if_unset=True):
+        """Color tunnel points by their distance to a user-selected reference atom/center.
+
+        prompt_if_unset: when True (radiobutton / select button) and no reference atom
+        has been chosen yet, pop the atom picker. When False (the 'calc per tunnel'
+        toggle) just do nothing if nothing is selected -- toggling the scaling mode
+        must never prompt for an atom.
+        """
         Console("OFF")
         tar = target()
         save_pairs = PairObj(tar)
@@ -477,6 +483,9 @@ def tunneler_dialog():
         # if the distance center is the same as before, we can reuse the color stored in SegAtom
         dist_sel = PairObj(tar, 'dist_sel')
         if dist_sel == []:
+            if not prompt_if_unset:
+                Console("hidden")
+                return
             atms = SelectDistAtom(win=True)
             dist_sel = PairObj(tar, 'dist_sel')
         else:
@@ -1505,8 +1514,14 @@ def tunneler_dialog():
     button18.place(anchor="nw", x=165, y=155)
 
     pertun_chk = tk.BooleanVar()  # Variable to track the checkbox status
+    def on_pertun_toggle():
+        # Recolour immediately when the scaling mode is toggled, but only while we
+        # are already colouring by distance with a chosen reference -- never pop the
+        # atom picker just because this flag changed.
+        if radio_col_var.get() == 'distance' and PairObj(target(), 'dist_sel') != []:
+            Colorbytunneldist(prompt_if_unset=False)
     checkbutton7 = ttk.Checkbutton(tab2_appear)
-    checkbutton7.configure(text='calc per tunnel', variable=pertun_chk)
+    checkbutton7.configure(text='calc per tunnel', variable=pertun_chk, command=on_pertun_toggle)
     checkbutton7.place(anchor="nw", x=90, y=182)
 
     def choose_color():
