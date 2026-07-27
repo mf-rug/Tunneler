@@ -99,6 +99,29 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
 
+def _attach_elapsed_timer(win):
+    """Add a live MM:SS elapsed-time label to a progress-bar popup.
+
+    The work runs in a worker thread while the tk event loop keeps ticking on the
+    main thread, so a self-rescheduling `after()` updates the label live. Elapsed is
+    computed from an absolute start, so the display stays accurate even if ticks are
+    delayed; the loop stops itself once the window is destroyed.
+    """
+    timer_label = ttk.Label(win, text="00:00")
+    timer_label.pack(pady=(0, 5))
+    timer_start = time.perf_counter()
+    def _tick():
+        try:
+            if not win.winfo_exists():
+                return
+            el = int(time.perf_counter() - timer_start)
+            timer_label.config(text=f'{el // 60:02d}:{el % 60:02d}')
+            win.after(250, _tick)
+        except tk.TclError:
+            return
+    win.after(0, _tick)
+
+
 def tunneler_dialog():
     """Build and run the 3-tab Tunneler tkinter dialog.
 
@@ -905,6 +928,8 @@ def tunneler_dialog():
         percent_label = ttk.Label(progress_window, text="0%")  # Initial text for the label
         percent_label.pack(pady=5)
 
+        _attach_elapsed_timer(progress_window)
+
         Tunneler(target=re.findall(r"\d+(?=:)", target_option.get())[0], ignore_res=[listbox.get(i) for i in listbox.curselection()],
                  ignore_surface=ign_surf_scale_chk.get(), 
                  ball_spacing=ball_spacing_scale_chk.get(),
@@ -1040,7 +1065,9 @@ def tunneler_dialog():
 
         percent_label = ttk.Label(progress_window, text="0%")  # Initial text for the label
         percent_label.pack(pady=30)
-        
+
+        _attach_elapsed_timer(progress_window)
+
         threading.Thread(target=on_new_sphere, args=(new, True)).start()
 
 

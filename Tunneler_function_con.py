@@ -614,7 +614,7 @@ def generate_tunnel_points(target, point_protein_distance, ignore_res, mds):
     return(points_to_cluster)
 
 
-def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_cut, recluster=False):
+def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_cut, recluster=False, start_time=None):
     """Cluster tunnel points using DBSCAN and create per-cluster YASARA objects.
 
     For each cluster above the minimum volume threshold:
@@ -684,7 +684,10 @@ def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_
     CenterAtom('All')
     BallStickAll()
     DelObj(f'TunnelPoints')
-    w('|   Finished clustering.')
+    if start_time is not None:
+        w(f'|   Finished clustering in {time.perf_counter() - start_time:.2f} seconds.')
+    else:
+        w('|   Finished clustering.')
 
 
 # ============================================================
@@ -869,7 +872,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
         progress_var.set(80)
         percent_label.config(text=f'80%')
 
-    cluster_tunnel_points_dbscan(target, points_to_cluster, min_vol, ball_spacing, connect_cut)
+    cluster_tunnel_points_dbscan(target, points_to_cluster, min_vol, ball_spacing, connect_cut, start_time=start_time)
 
     if progress_var != None and percent_label != None:  
         progress_var.set(90)
