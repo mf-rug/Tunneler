@@ -221,7 +221,15 @@ def tunneler_dialog():
         SwitchObj(ListObj(f'{tar}Cl???????')[:5], "ON")
         transf_and_fix_ss(tar)
         DelObj('???_sphere ???_shape')
+        # Recluster recreated the clusters (freshly coloured by tunnel) and invalidated
+        # any distance colouring. Drop the whole distance cache (selection + colour +
+        # signature) and reflect the reality in the GUI: select the 'Tunnel' colour mode
+        # and reset the distance atom selector, so it no longer claims a stale reference.
         PairObj(tar, 'dist_sel', '')
+        PairObj(tar, 'dist_col', '')
+        PairObj(tar, 'dist_sig', '')
+        radio_col_var.set('tunnel')
+        button18.configure(text='select')
         # Recluster changed the cluster set -> refresh the slider's precomputed distances.
         _precompute_surf_dist(tar)
         HideMessage()
