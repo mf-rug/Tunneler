@@ -124,6 +124,24 @@ def _attach_elapsed_timer(win):
     win.after(0, _tick)
 
 
+# --- Sphere .obj geometry cache ----------------------------------------------
+# The dominant cost of a sphere rebuild is writing the (multi-hundred-MB) .obj
+# file, not YASARA's parse of it (~4.7s vs ~1.25s for a 118k-point tunnel). The
+# geometry is independent of alpha (alpha is only a LoadWOb arg, and there is no
+# in-place alpha command), so an alpha-only rebuild can reuse the exact files and
+# just re-LoadWOb them -- ~4x faster. We keep the files in a dedicated temp dir.
+#
+# Crash-safety: the dir is wiped on plugin load (clearing any files a previously
+# crashed YASARA left behind), on atexit for clean exits, and by _sph_cache_clear
+# during a session. Everything lives under one directory so a stale-file leak is
+# impossible to accumulate across runs.
+import shutil, atexit
+_SPH_OBJ_DIR = os.path.join(tempfile.gettempdir(), 'tunneler_sphere_obj_cache')
+shutil.rmtree(_SPH_OBJ_DIR, ignore_errors=True)   # drop leftovers from a prior (maybe crashed) run
+os.makedirs(_SPH_OBJ_DIR, exist_ok=True)
+atexit.register(lambda: shutil.rmtree(_SPH_OBJ_DIR, ignore_errors=True))
+
+
 _ICOSPHERE_CACHE = {}
 
 def _icosphere(level):
@@ -167,7 +185,7 @@ def _write_obj_rows(f, arr, rowfmt, chunk=1000000):
         f.write(((rowfmt * len(blk)) % tuple(blk.ravel().tolist())).encode())
         i += chunk
 
-def _load_sphere_mesh(centers, radius, color, alpha, level):
+def _load_sphere_mesh(centers, radius, color, alpha, level, path=None, reuse=False):
     """Draw many equal-radius spheres of a SINGLE colour as one polygon-mesh object,
     built in numpy and imported via LoadWOb in a single call. This replaces ~2 YASARA
     calls per sphere (ShowSphere+PosObj) with one file load -> ~15x faster at large
@@ -180,28 +198,37 @@ def _load_sphere_mesh(centers, radius, color, alpha, level):
         YASARA shades the spheres' dark interiors (they render near-black);
       * open='No' culls back faces -> matches ShowSphere's transparency density so the
         alpha slider maps 1:1 (no remap needed).
-    """
-    Vt, Ft = _icosphere(level)
-    centers = np.asarray(centers, float).reshape(-1, 3)
-    C = centers.copy(); C[:, 2] *= -1
-    Vr = Vt.copy(); Vr[:, 2] *= -1          # z-reflect template to cancel LoadWOb's T
-    Fr = Ft[:, ::-1]                        # reverse winding (z-reflection flipped it)
-    n = len(C); vpr = len(Vr)
-    verts = (C[:, None, :] + Vr[None, :, :] * radius).reshape(-1, 3)
-    norms = np.tile(Vr, (n, 1))
-    faces = (Fr[None, :, :] + 1 + (np.arange(n) * vpr)[:, None, None]).reshape(-1, 3)
-    face6 = np.repeat(faces, 2, axis=1)     # 'f a//a b//b c//c' needs each index twice
-    fd, path = tempfile.mkstemp(suffix='.obj', prefix='ts'); os.close(fd)
+
+    Geometry caching: `path`, when given, is a stable file to write the mesh to and
+    keep (not a throwaway temp). If `reuse` is True and that file already exists, the
+    write is skipped entirely and the cached .obj is re-loaded with the current colour
+    and alpha -- geometry is independent of both, so an alpha (or tunnel-mode colour)
+    change costs only the LoadWOb parse, not the dominant file-write. With no `path`
+    the old throwaway-temp behaviour is kept."""
+    own_temp = path is None
+    if own_temp:
+        fd, path = tempfile.mkstemp(suffix='.obj', prefix='ts'); os.close(fd)
     try:
-        with open(path, 'wb') as f:
-            _write_obj_rows(f, verts, 'v %.3f %.3f %.3f\n')
-            _write_obj_rows(f, norms, 'vn %.3f %.3f %.3f\n')
-            _write_obj_rows(f, face6, 'f %d//%d %d//%d %d//%d\n')
+        if not (reuse and os.path.exists(path)):
+            Vt, Ft = _icosphere(level)
+            centers = np.asarray(centers, float).reshape(-1, 3)
+            C = centers.copy(); C[:, 2] *= -1
+            Vr = Vt.copy(); Vr[:, 2] *= -1          # z-reflect template to cancel LoadWOb's T
+            Fr = Ft[:, ::-1]                        # reverse winding (z-reflection flipped it)
+            n = len(C); vpr = len(Vr)
+            verts = (C[:, None, :] + Vr[None, :, :] * radius).reshape(-1, 3)
+            norms = np.tile(Vr, (n, 1))
+            faces = (Fr[None, :, :] + 1 + (np.arange(n) * vpr)[:, None, None]).reshape(-1, 3)
+            face6 = np.repeat(faces, 2, axis=1)     # 'f a//a b//b c//c' needs each index twice
+            with open(path, 'wb') as f:
+                _write_obj_rows(f, verts, 'v %.3f %.3f %.3f\n')
+                _write_obj_rows(f, norms, 'vn %.3f %.3f %.3f\n')
+                _write_obj_rows(f, face6, 'f %d//%d %d//%d %d//%d\n')
         obj = LoadWOb(path, color=color, alpha=alpha, open='No')[0]
         PosObj(obj, 0, 0, 0)
         return obj
     finally:
-        if os.path.exists(path):
+        if own_temp and os.path.exists(path):
             os.remove(path)
 
 
@@ -233,7 +260,8 @@ def _skimage_missing():
     return importlib.util.find_spec('skimage') is None
 
 
-def _union_shape_mesh(centers, colors, radius, alpha, voxel=0.3, smooth=0.8):
+def _union_shape_mesh(centers, colors, radius, alpha, voxel=0.3, smooth=0.8,
+                      geom_cache=None, geom_key=None, geom_frame=None):
     """'Merged spheres' surface: the union of balls of `radius` around `centers`,
     extracted with marching cubes over a signed-distance grid (dist-to-nearest-centre
     minus radius) built with cKDTree. Each surface vertex takes the colour of its
@@ -241,27 +269,44 @@ def _union_shape_mesh(centers, colors, radius, alpha, voxel=0.3, smooth=0.8):
     by colour into per-colour LoadWOb meshes and joined into one object (returned), or
     None if the selection yields no surface. Cheap: ~0.3-0.5s for a several-k-point
     tunnel. `smooth` Gaussian-blurs the grid for a rounder (metaball-like) blob; `voxel`
-    trades surface detail against cost."""
-    from skimage import measure                       # in the venv; imported lazily
+    trades surface detail against cost.
+
+    Geometry caching: the marching-cubes step (the expensive part) depends only on the
+    centres + radius, NOT on alpha or the colouring. When `geom_cache` (a dict) and
+    `geom_key` are given, the (verts, faces, norms) are cached under that key and reused,
+    so an alpha change (rebuild) OR a colour-mode change skips marching cubes entirely --
+    only the per-colour split + LoadWOb (with the current colours/alpha) re-runs. The
+    `centers` are GLOBAL (screen-frame) coords, which change when the structure is
+    rotated/moved, so the cache entry is tagged with `geom_frame` (the source object's
+    position+orientation) and reused only while that is unchanged -- otherwise the mesh
+    would be baked at a stale orientation and appear offset from the other reps."""
     centers = np.asarray(centers, float).reshape(-1, 3)
     colors = np.asarray(colors)
     if len(centers) == 0:
         return None
-    margin = radius + 2 * voxel
-    lo = centers.min(0) - margin; hi = centers.max(0) + margin
-    ax = [np.arange(lo[d], hi[d], voxel) for d in range(3)]
-    gx, gy, gz = np.meshgrid(*ax, indexing='ij')
-    pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
+    cached = geom_cache.get(geom_key) if geom_cache is not None else None
+    if cached is not None and cached[0] == geom_frame:
+        verts, faces, norms = cached[1], cached[2], cached[3]   # reuse cached marching-cubes geometry
+    else:
+        from skimage import measure                       # in the venv; imported lazily
+        margin = radius + 2 * voxel
+        lo = centers.min(0) - margin; hi = centers.max(0) + margin
+        ax = [np.arange(lo[d], hi[d], voxel) for d in range(3)]
+        gx, gy, gz = np.meshgrid(*ax, indexing='ij')
+        pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
+        sdf = (cKDTree(centers).query(pts)[0] - radius).reshape(gx.shape)
+        if smooth > 0:
+            from scipy.ndimage import gaussian_filter
+            sdf = gaussian_filter(sdf, smooth)
+        try:
+            verts, faces, norms, _ = measure.marching_cubes(sdf, level=0.0, spacing=(voxel, voxel, voxel))
+        except (ValueError, RuntimeError):
+            return None
+        verts = verts + lo
+        if geom_cache is not None:
+            geom_cache[geom_key] = (geom_frame, verts, faces, norms)
+    # colour the (possibly cached) geometry by the CURRENT colours
     tree = cKDTree(centers)
-    sdf = (tree.query(pts)[0] - radius).reshape(gx.shape)
-    if smooth > 0:
-        from scipy.ndimage import gaussian_filter
-        sdf = gaussian_filter(sdf, smooth)
-    try:
-        verts, faces, norms, _ = measure.marching_cubes(sdf, level=0.0, spacing=(voxel, voxel, voxel))
-    except (ValueError, RuntimeError):
-        return None
-    verts = verts + lo
     fcol = colors[tree.query(verts)[1]][faces[:, 0]].astype(int)   # face colour = nearest-centre colour of its 1st vertex
     objs = []
     for cv in np.unique(fcol):
@@ -380,6 +425,7 @@ def tunneler_dialog():
         transf_and_fix_ss(tar)
         DelObj('???_sphere ???_shape')
         _sph_cache_clear()     # new clusters -> any stashed sphere sets are stale
+        _sph_obj_cache_clear() # ... and the point positions changed -> drop .obj geometry cache
         _shape_cache_clear()   # ... and any stashed shape (surface) sets
         # Recluster recreated the clusters (freshly coloured by tunnel) and invalidated
         # any distance colouring. Drop the whole distance cache (selection + colour +
@@ -563,7 +609,17 @@ def tunneler_dialog():
         current on/off state -- used when rebuilding for a colour switch, where the
         clusters are hidden (spheres are the active view) so their state would wrongly
         hide the new spheres."""
-        DelObj('???_Sphere')
+        # A rebuild (e.g. an alpha/size slider release) happens while spheres are the
+        # active view, so the clusters are hidden and their on/off state is a misleading
+        # 'Off'. Read the intended visibility from the spheres we're about to replace
+        # instead (keyed by the 3-digit tunnel prefix), falling back to the cluster state
+        # on first build.
+        #
+        # Anti-flicker: rather than delete ALL old spheres up front (leaving the scene
+        # blank while everything rebuilds), each tunnel's old mesh is kept visible until
+        # its replacement is loaded, then swapped in place (see the per-tunnel tail).
+        prev_on = {nm[:3]: st for nm, st in
+                   zip(NameObj('???_Sphere'), SwitchObj('???_Sphere'))}
         tunnel_objs = ListObj(f'{target()}Cl???????')
         total_spheres = CountAtom(f'Obj {target()}Cl???????')
         # Pick the smoothest sphere tessellation whose total triangle count stays
@@ -579,14 +635,23 @@ def tunneler_dialog():
         Wait(1)
         radius = rad_chk.get() / 100 * 2.5
         alpha = alpha_chk.get()
+        # Geometry cache: the .obj files depend on positions+radius+level (+colour
+        # partition in distance mode), NOT on alpha. If those are unchanged since the
+        # last build, reuse the files on disk and skip the (dominant) write -- only the
+        # LoadWOb parse re-runs, applying the new alpha/colour. Positions change only on
+        # re-predict/recluster, which call _sph_obj_cache_clear() to reset this.
+        mode = radio_col_var.get()
+        mode_tag = 'd' if mode == 'distance' else 't'
+        geo_sig = _sph_geo_sig(mode, sphere_level)
+        reuse = (geo_sig == _sph_state.get('geo'))
         done = 0
         for targetobj in tunnel_objs:
             ShowMessage(f"Creating {CountAtom(f'Obj {targetobj}'):,} spheres of tunnel "
                         f"{NameObj(targetobj)[0]} at {_roundness} roundness (level {sphere_level}/3)")
             Wait(1)
-            on_off = 'On' if force_show else SwitchObj(targetobj)[0]
+            on_off = 'On' if force_show else prev_on.get(f'{targetobj:03d}', SwitchObj(targetobj)[0])
             SwitchObj(targetobj, 'Off')
-            DelObj(f'sphere x{targetobj:03d}_sphere')
+            DelObj('sphere')   # clear stray temp meshes only; the OLD tunnel mesh stays until swapped
             p = np.array(PosAtom(f'obj {targetobj}', coordsys='global')).reshape(-1, 3)
             col = np.array(ColorAtom(f'obj {targetobj}'))
 
@@ -598,7 +663,9 @@ def tunneler_dialog():
             uniq, starts = np.unique(col_s, return_index=True)
             bounds = list(starts) + [len(col_s)]
             for i, cv in enumerate(uniq):
-                o = _load_sphere_mesh(p_s[bounds[i]:bounds[i + 1]], radius, int(cv), alpha, sphere_level)
+                fpath = os.path.join(_SPH_OBJ_DIR, f'sph_{mode_tag}_{targetobj:03d}_{i}.obj')
+                o = _load_sphere_mesh(p_s[bounds[i]:bounds[i + 1]], radius, int(cv),
+                                      alpha, sphere_level, path=fpath, reuse=reuse)
                 NameObj(o, 'sphere')
                 if progress:
                     frac = (done + bounds[i + 1]) / total_spheres * 100
@@ -618,7 +685,14 @@ def tunneler_dialog():
             jobj = ListObj('sphere')[0]
             JoinObj('sphere', jobj, center='No')
             SwitchObj(jobj, on_off)
+            # Swap in place: the new mesh (still named 'sphere') is loaded and visible, so
+            # only now delete this tunnel's OLD mesh and give the new one its name. Other
+            # tunnels keep their old meshes shown -> no blank flash.
+            DelObj(f'{targetobj:03d}_sphere')
             NameObj(jobj, f'{targetobj:03d}_sphere')
+        # the .obj files now on disk match this signature; a later build with the same
+        # signature (e.g. only alpha changed) can reuse them.
+        _sph_state['geo'] = geo_sig
 
     def Spheres(new=False, progress=False):
         """Switch tunnel display to sphere mode (one mesh sphere per tunnel point)."""
@@ -647,7 +721,9 @@ def tunneler_dialog():
     # inactive mode's set hidden and renamed (sphT###/sphD### -- deliberately NOT
     # matching the plugin's '???_sphere' selectors) and just swap, rebuilding only when
     # the geometry/colour settings for that mode actually changed.
-    _sph_state = {'mode': None, 'sig': {}}   # 'mode' = colouring of the visible set
+    # 'mode' = colouring of the visible set; 'geo' = signature of the .obj files
+    # currently on disk (see _sph_geo_sig / the geometry cache in build_sphere_objects).
+    _sph_state = {'mode': None, 'sig': {}, 'geo': None}
     _SPH_SUF = {'tunnel': 'T', 'distance': 'D'}
 
     def _sph_sig(mode):
@@ -658,10 +734,40 @@ def tunneler_dialog():
         tar = target()
         return f'distance|{base}|{PairObj(tar, "dist_sel")}|{PairObj(tar, "dist_sig")}'
 
+    def _obj_frame_sig(objs):
+        """Compact signature of objects' current position+orientation (PosOriObj). Mesh
+        geometry is baked in GLOBAL (screen-frame) coords, which change when the user
+        rotates or moves the structure, so a cache is only valid while this is unchanged;
+        otherwise the reused mesh is baked at a stale orientation and appears offset."""
+        return ';'.join(str(o) + ':' + ','.join(f'{v:.2f}' for v in PosOriObj(o)) for o in objs)
+
+    def _sph_geo_sig(mode, level):
+        """Signature of the on-disk .obj GEOMETRY. Excludes alpha (only a LoadWOb arg)
+        and, for tunnel mode, the colour step (one block per tunnel regardless), so an
+        alpha or tunnel-colour change is a cache HIT that skips the dominant file write.
+        Radius and tessellation level DO change vertex data, so they're included, as does
+        the object frame (globals go stale on rotate/move -- see _obj_frame_sig)."""
+        base = f'r{rad_chk.get()}|L{level}'
+        frame = _obj_frame_sig(ListObj(f'{target()}Cl???????'))
+        if mode == 'tunnel':
+            return f'tunnel|{base}|{frame}'
+        tar = target()
+        return f'distance|{base}|{PairObj(tar, "dist_sel")}|{PairObj(tar, "dist_sig")}|{frame}'
+
     def _sph_cache_clear():
+        """Invalidate the colour-mode stash (does NOT touch the .obj geometry files,
+        which survive a rebuild so an alpha/colour change can reuse them)."""
         DelObj('sphT??? sphD???')
         _sph_state['mode'] = None
         _sph_state['sig'] = {}
+
+    def _sph_obj_cache_clear():
+        """Drop the on-disk .obj geometry cache. Called only when the point positions
+        themselves change (re-predict / recluster) -- radius/alpha/colour changes reuse
+        the files instead. Crash leftovers are handled by the load-time dir wipe."""
+        shutil.rmtree(_SPH_OBJ_DIR, ignore_errors=True)
+        os.makedirs(_SPH_OBJ_DIR, exist_ok=True)
+        _sph_state['geo'] = None
 
     def recolor_spheres_for_mode(mode):
         """Called when the colour mode changes to `mode`. If spheres are the active view,
@@ -1205,6 +1311,7 @@ def tunneler_dialog():
         # sets (objects + state), else stale shpV/A/M### / sphT/D### objects linger and a
         # stale signature could cause a false cache hit.
         _sph_cache_clear()
+        _sph_obj_cache_clear()   # new positions -> drop .obj geometry cache
         _shape_cache_clear()
 
         Tunneler(target=re.findall(r"\d+(?=:)", target_option.get())[0], ignore_res=[listbox.get(i) for i in listbox.curselection()],
@@ -1364,22 +1471,44 @@ def tunneler_dialog():
     radiobutton6.configure(text='Spheres', variable=radio_var, value="spheres", command=lambda: show_progress_spheres(new=False))
     radiobutton6.place(anchor="nw", x=3, y=105)
 
+    def _on_sphere_alpha_release(*_):
+        """Apply a sphere-alpha slider change on release. Mesh spheres can't be re-alpha'd
+        in place, so this rebuilds -- but alpha is excluded from the geometry signature,
+        so the cached .obj files are reused and only the (fast) LoadWOb re-runs. No-op
+        unless spheres are the active view. Size still uses the explicit 'new' button, as
+        it needs a full geometry rewrite."""
+        if radio_var.get() != 'spheres' or ListObj('???_Sphere') == []:
+            return
+        Spheres(new=True)
+
     alpha_chk = tk.IntVar()
     scale2 = ttk.Scale(tab2_appear, from_=1, to=100)
     scale2.configure(orient="horizontal", state="normal", variable=alpha_chk)
     scale2.place(anchor="nw", x=125, y=85, height=30, width=136)
     alpha_chk.set(19)
+    # apply on release: reuses cached geometry, re-LoadWOb with the new alpha
+    scale2.bind('<ButtonRelease-1>', _on_sphere_alpha_release)
+
+    def _on_sphere_size_release(*_):
+        """Apply a size slider change on release. The size slider is shared: it's the ball
+        radius for both Spheres and the MergeSph shape (VdW/accessible ignore it). Size
+        changes every vertex, so the geometry is fully rebuilt (spheres: rewrite .obj via
+        the progress window; MergeSph: recompute marching cubes). No-op for reps that don't
+        use size."""
+        rv = radio_var.get()
+        if rv == 'spheres' and ListObj('???_Sphere') != []:
+            show_progress_spheres()
+        elif rv == 'shape' and shape_surf_option.get() == 'MergeSph' and ListObj('???_shape') != []:
+            Shapes(new=True)   # MergeSph radius changed -> marching-cubes recompute
 
     rad_chk = tk.IntVar()
     scale3 = ttk.Scale(tab2_appear, from_= 4, to=100)
     scale3.configure(orient="horizontal", state="normal", variable=rad_chk)
     scale3.place(anchor="nw", x=125, y=106, height=30, width=136)
     rad_chk.set(18)
+    # apply on release: full geometry rebuild (size changes every vertex)
+    scale3.bind('<ButtonRelease-1>', _on_sphere_size_release)
 
-    button13 = ttk.Button(tab2_appear)
-    button13.configure(style="Toolbutton", text='new', command=show_progress_spheres)
-    button13.place(anchor="nw", width=39, x=267, y=97)
- 
     label1 = ttk.Label(tab2_appear)
     label1.configure(text = 'alpha')
     label1.place(anchor="nw", x=90, y=88)
@@ -1398,21 +1527,44 @@ def tunneler_dialog():
     # on swap-in.
     _shape_state = {'surf': None, 'sig': {}}
     _SHAPE_SUF = {'VdW': 'V', 'accessible': 'A', 'MergeSph': 'M'}
+    # MergeSph marching-cubes geometry, keyed by (tunnel obj, radius). Reused across
+    # alpha/colour changes (they don't affect the geometry); dropped when positions
+    # change (re-predict / recluster call _shape_cache_clear).
+    _mrg_geom_cache = {}
 
     def _shape_sig(surf):
-        sig = f'{surf}|a{shape_alpha_chk.get()}'
+        # VdW/accessible are dynamic surfaces whose alpha is changed in place via
+        # ColorSurfObj (see _apply_shape_alpha), so alpha is EXCLUDED from their
+        # signature -- an alpha change must not invalidate the cache / force a rebuild.
+        # MergeSph bakes alpha into its mesh at LoadWOb time, so it stays in the sig
+        # (the rebuild it triggers reuses the cached marching-cubes geometry).
         if surf == 'MergeSph':
-            sig += f'|r{rad_chk.get()}|c{radio_col_var.get()}'
+            sig = f'{surf}|a{shape_alpha_chk.get()}|r{rad_chk.get()}|c{radio_col_var.get()}'
             if radio_col_var.get() == 'distance':
                 tar = target(); sig += f'|{PairObj(tar, "dist_sel")}|{PairObj(tar, "dist_sig")}'
             else:
                 sig += f'|s{step_entry.get()}'
-        return sig
+            return sig
+        return f'{surf}'
 
     def _shape_cache_clear():
         DelObj('shpV??? shpA??? shpM???')
         _shape_state['surf'] = None
         _shape_state['sig'] = {}
+        _mrg_geom_cache.clear()   # positions changed -> cached marching-cubes geometry is stale
+
+    def _apply_shape_alpha(surf=None):
+        """Re-apply the current shape alpha to the visible VdW/accessible surfaces IN
+        PLACE (ColorSurfObj on a dynamic surface -> no surface recompute, ~instant).
+        MergeSph alpha is baked into its mesh, so it's a no-op here (handled by a
+        rebuild that reuses the cached marching-cubes geometry)."""
+        if surf is None:
+            surf = shape_surf_option.get()
+        if surf == 'MergeSph':
+            return
+        a = shape_alpha_chk.get()
+        for o in ListObj('???_shape'):
+            ColorSurfObj(o, surf, outcol='atomcol', outalpha=a, incol='atomcol', inalpha=a)
 
     def _recolor_active_shape():
         """Recolour the visible atom-based ???_shape set (VdW/accessible) to the current
@@ -1451,7 +1603,10 @@ def tunneler_dialog():
                 on_off = SwitchObj(targetobj)[0]
                 p = np.array(PosAtom(f'obj {targetobj}', coordsys='global')).reshape(-1, 3)
                 col = np.array(ColorAtom(f'obj {targetobj}'))
-                j = _union_shape_mesh(p, col, radius, shape_alpha_chk.get())
+                j = _union_shape_mesh(p, col, radius, shape_alpha_chk.get(),
+                                      geom_cache=_mrg_geom_cache,
+                                      geom_key=(int(targetobj), rad_chk.get()),
+                                      geom_frame=_obj_frame_sig([targetobj]))
                 if j is None:
                     continue
                 SwitchObj(j, on_off)
@@ -1518,6 +1673,7 @@ def tunneler_dialog():
                     NameObj(o, f'{num}_shape'); SwitchObj(o, 'On')
                 if surf != 'MergeSph':
                     _recolor_active_shape()   # colour excluded from VdW/acc sig -> recolour now
+                    _apply_shape_alpha(surf)  # alpha too excluded from sig -> re-alpha the stashed set now
             else:
                 DelObj(f'shp{_SHAPE_SUF[surf]}???')   # stale cache for this surf
                 if surf == 'MergeSph' and _skimage_missing():
@@ -1538,6 +1694,19 @@ def tunneler_dialog():
         Wait(1)
         Console("hidden")
 
+    def _on_shape_alpha_release(*_):
+        """Apply a shape-alpha slider change. VdW/accessible re-alpha in place (instant,
+        no surface recompute); MergeSph rebuilds but reuses the cached marching-cubes
+        geometry, so only the (cheap) LoadWOb re-runs. No-op unless a shape is shown."""
+        if radio_var.get() != 'shape':
+            return
+        Console("OFF")
+        if shape_surf_option.get() == 'MergeSph':
+            Shapes(new=True)
+        else:
+            _apply_shape_alpha()
+        Console("hidden")
+
     radiobutton7 = ttk.Radiobutton(tab2_appear)
     radiobutton7.configure(text='Shape', variable=radio_var, value="shape", command=lambda: Shapes())
     radiobutton7.place(anchor="nw", x=3, y=125)
@@ -1555,6 +1724,8 @@ def tunneler_dialog():
     shape_alpha_scale.configure(orient="horizontal", state="normal", variable=shape_alpha_chk)
     shape_alpha_scale.place(anchor="nw", x=200, y=125, height=30, width=100)
     shape_alpha_chk.set(80)
+    # apply on release: dynamic surfaces re-alpha in place, MergeSph reloads from cache
+    shape_alpha_scale.bind('<ButtonRelease-1>', _on_shape_alpha_release)
 
 
     # target -> (n_cluster_atoms, min_dist, max_dist). The per-atom distance itself
