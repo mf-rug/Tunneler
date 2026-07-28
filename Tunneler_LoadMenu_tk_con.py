@@ -393,7 +393,8 @@ def tunneler_dialog():
 
     def Spheres(new=False, progress=False):
         """Switch tunnel display to sphere mode (one YASARA sphere per tunnel point)."""
-        Console("OFF")
+        Console("OFF")   # load-bearing: with the console ON every ShowSphere/PosObj prints,
+                         # making the build ~220x slower (measured 0.75s -> 167s for 5000 spheres)
         if ListObj('???_Sphere') != [] and not new:
             on_tunnels = [x for x,y in zip(ListObj(f'{target()}Cl???????'), SwitchObj(f'{target()}Cl???????')) if y == 'On']
             if len(on_tunnels) == 0:
@@ -436,7 +437,14 @@ def tunneler_dialog():
                     if o == modulo_value:
                         modulo_value += 1000
                         jobj = ListObj('sphere')[0]
-                        JoinObj('sphere', jobj)
+                        # center='No' is critical: the default (Center=Yes) recomputes the
+                        # geometric center and shifts every vertex of the whole accumulating
+                        # object on each join -> O(N^2). With center='No' the join is a cheap
+                        # relabel, cutting sphere build ~4.5x at large tunnels (e.g. 47s->10s
+                        # for ~118k points). World positions are unchanged (spheres are already
+                        # PosObj'd to global coords); only the object's local rotation pivot moves,
+                        # which the plugin never uses.
+                        JoinObj('sphere', jobj, center='No')
                         ShowMessage(f'Created {o:,} / {len(atomlist):,} spheres of tunnel {NameObj(targetobj)[0]}.')
                         Wait(1)
                         if progress:
@@ -448,7 +456,7 @@ def tunneler_dialog():
                     percent_label.config(text=f'{done / total_spheres *100:.0f}%')
 
                 jobj = ListObj('sphere')[0]
-                JoinObj('sphere', jobj)
+                JoinObj('sphere', jobj, center='No')   # see center='No' note above (avoids O(N^2) re-centering)
                 SwitchObj(jobj, on_off)
                 NameObj('sphere', f'{targetobj:03d}_sphere')
 
