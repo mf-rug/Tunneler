@@ -22,7 +22,11 @@ scipy==1.17.1
 scikit-learn==1.8.0
 # scikit-image: marching cubes for the 'MergeSph' (merged-spheres) tunnel shape.
 scikit-image==0.26.0
-shapely==2.0.4
+# shapely>=2.0.5 is required for numpy 2.x: 2.0.4's compiled ufuncs (e.g.
+# create_collection used by unary_union) break under numpy>=2 with
+# "ufunc 'create_collection' not supported for the input types". 2.0.6 keeps the
+# same 2.0.x geometry algorithms (cross-section areas byte-identical) + numpy-2 fix.
+shapely==2.0.6
 # matplotlib must be >=3.9.2 for Tcl/Tk 9 support (older versions fail with
 # "ImportError: Failed to load Tcl_SetVar" on the tkagg backend).
 matplotlib==3.11.0

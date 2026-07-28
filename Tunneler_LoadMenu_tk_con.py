@@ -3315,57 +3315,50 @@ def tunneler_dialog():
 
 
     def make_axis(tnl_name):
-        """Create a PCA-based principal axis for a tunnel and load it as a YASARA object.
+        """Create a PCA-based principal axis for a tunnel as a YASARA object.
 
-        Saves the tunnel surface as a .obj file, computes PCA to find the principal
-        axis, identifies the two extreme points (inner/outer), and creates an arrow
-        and axis object in YASARA.
+        Computes the tunnel's principal axis (PCA) directly from the tunnel
+        points' GLOBAL coordinates and places two marker atoms at the extreme
+        points along that axis (inner 'In' / outer 'Out'), with a black arrow
+        between them.
 
         Returns (ext_center_atom, ext_outer_atom) — atom numbers of the two endpoints.
+
+        NOTE: this used to save the tunnel surface to a .obj, reload the vertices
+        via a centred PDB and TransferObj them back onto the tunnel. That round-trip
+        (plus a "rotate 180 deg around y for transfer to work" hack) mis-restored the
+        global frame, so the arrow appeared shifted in space. The tunnel points are
+        already in the scene at known global positions, so we read them directly and
+        skip the whole fragile export/re-import.
         """
         DelObj('???_axis ???_slice')
-        # create the surface of the tunnel points as static object
-        stat_surf = ShowSurfObj(tnl_name, 'vdw', 'static')
 
-        # save the surface as obj
-        surf_obj_file = os.path.join(PWD(), f'{NameObj(target())[0]}_{tnl_name}.obj')
-        SaveWOb(stat_surf, surf_obj_file)
-        Wait('continuebutton')
-        
-        DelObj(stat_surf)
+        # Tunnel points in global coordinates; the axis lives in the same frame.
+        pts = np.array(PosAtom(f'obj {tnl_name}', coordsys='global')).reshape(-1, 3)
+        axis = find_principal_axis(pts)
+        p1, p2 = find_extreme_points(pts, axis)   # two extreme tunnel points (global)
 
-        # use load_obj to create vertices and faces
-        my_vertices, my_faces = load_obj(surf_obj_file)
+        # Two marker atoms placed directly at the extremes (global coords).
+        n = BuildAtom('C', copies=2)              # one object, two overlaid atoms
+        endatoms = ListAtom(f'obj {n}')
+        PosAtom(f'atom {endatoms[0]}', x=p1[0], y=p1[1], z=p1[2], coordsys='global')
+        PosAtom(f'atom {endatoms[1]}', x=p2[0], y=p2[1], z=p2[2], coordsys='global')
 
-        # write vertices as pdb file, with extreme points marked in residue column as EXT
-        vert_pdb = os.path.join(PWD(), f'{NameObj(target())[0]}_{tnl_name}_vertRot.pdb')
-        axis = find_principal_axis(my_vertices)
-        extremes = find_extreme_points(my_vertices, axis)
-        # for some reason, the points  need to be rotated 180° around the y-axis for transfering to work
-        write_vertices_to_pdb(my_vertices, extremes, vert_pdb, rotate=True)
-
-        # load pdb and transfer to the same coordinate system as the original tunnel points
-        n = LoadPDB(vert_pdb, center=True)[0]
-        Wait('continuebutton')
-        TransferObj(n, tnl_name, 'keep')
-        Wait('continuebutton')
-        
-        # create helper atom at center of target to determine what is inside and what is outside
-        cx,cy,cz = PosAtom(f"obj {target()}", mean=True, coordsys='global')
+        # Inner = closer to the protein centre, outer = farther (tunnel mouth).
+        cx, cy, cz = PosAtom(f"obj {target()}", mean=True, coordsys='global')
         cen = BuildAtom("C")
-        PosAtom(f"obj {cen}", x = cx,y = cy, z = cz, coordsys='global')
-        DelRes(f'obj {n} res UNL')
+        PosAtom(f"obj {cen}", x=cx, y=cy, z=cz, coordsys='global')
         ext_center = ListAtom(f'obj {n} with minimum distance from obj {cen}')[0]
         ext_outer = ListAtom(f'obj {n} with maximum distance from obj {cen}')[0]
         NameAtom(ext_center, 'In')
         NameAtom(ext_outer, 'Out')
+        DelObj(f'{cen}')
 
         # show arrow between extremes
         ShowArrow('atatom', ext_outer, 'atatom',  ext_center, color='black')
         StickObj(n)
         ColorObj(n, 'black')
         NameObj(n, f'{ListObj(tnl_name)[0]:03d}_axis')
-        DelObj(f'{cen}')
         return ext_center, ext_outer
 
     def draw_diameter_plot(tnl_name, slice_obj, fig, ax, on_canvas=True, only_area=True):
@@ -3383,7 +3376,13 @@ def tunneler_dialog():
         plane_points_pos = np.array(PosAtom(f'obj {slice_obj}', coordsys='global')).reshape(-1,3)
         tnl_points_pos = np.array(PosAtom(f'Obj {tnl_name}', coordsys='global')).reshape(-1,3)
         ball_spacing = float(PairObj(target(), 'ball_spacing')[0])
-        threshold = ball_spacing / 800
+        # Slab half-thickness for "points near the cutting plane". The old value
+        # (ball_spacing / 800 ~ 0.0004 A) was far thinner than the point grid, so
+        # it caught ~zero points and the cross-section plot was always blank.
+        # ball_spacing / 2 catches ~one monolayer per plane position (adjacent
+        # slices tile without gaps) -> the buffered-circle union approximates the
+        # true cross-sectional area.
+        threshold = ball_spacing / 2
         near_plane, near_indices, not_near_plane, not_near_indices = find_points_near_plane(tnl_points_pos, plane_points_pos, distance_threshold=threshold)
         if near_indices.size > 0:
             tnl_points = np.array(ListAtom(f'Obj {tnl_name}'))
