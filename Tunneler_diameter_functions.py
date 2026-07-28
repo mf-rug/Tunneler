@@ -605,15 +605,7 @@ def calculate_diameter_analysis(tnl_name, slice_heights, ball_spacing, ext_cente
 # ============================================================
 
 from heapq import heappop, heappush
-
-def get_neighbors(point, point_index_map, ball_spacing, tolerance=1e-6):
-    """Find all points within ball_spacing distance of *point* (brute-force search)."""
-    neighbors = []
-    for key in point_index_map:
-        if np.linalg.norm(np.array(point) - np.array(key)) <= ball_spacing + tolerance:
-            neighbors.append(key)
-    return neighbors
-
+from scipy.spatial import cKDTree
 
 
 def heuristic(a, b):
@@ -627,14 +619,26 @@ def astar(start, end, points, point_index_map, spacing):
     Finds the shortest path from *start* to *end* by traversing neighboring
     points (within *spacing* distance). Uses Euclidean distance as the heuristic.
 
+    Neighbor lookup uses a KD-tree (scipy.cKDTree) rather than an O(N) brute-force
+    scan per node, turning the search from O(N^2) into ~O(N log N) on large clouds.
+    The result is identical to the brute-force version: the same neighbor set per
+    node (radius = spacing + 1e-6, matching the old tolerance), the same hop-count
+    step cost, and the same (f_score, point) heap ordering fully determine the path
+    regardless of the order neighbors are visited.
+
     Returns a list of point tuples forming the path, or None if no path exists.
     """
+    pts = list(points)
+    coords = np.asarray(pts, dtype=float)
+    tree = cKDTree(coords)
+    radius = spacing + 1e-6   # matches the old brute-force tolerance
+
     open_set = []
     heappush(open_set, (0, start))
     came_from = {}
-    g_score = {point: float('inf') for point in points}
+    g_score = {point: float('inf') for point in pts}
     g_score[start] = 0
-    f_score = {point: float('inf') for point in points}
+    f_score = {point: float('inf') for point in pts}
     f_score[start] = heuristic(start, end)
 
     while open_set:
@@ -648,16 +652,15 @@ def astar(start, end, points, point_index_map, spacing):
             path.append(start)
             return path[::-1]
 
-        neighbors = get_neighbors(current, point_index_map, spacing)
-
-        for neighbor in neighbors:
+        for nb in tree.query_ball_point(np.asarray(current, dtype=float), radius):
+            neighbor = pts[nb]
             tentative_g_score = g_score[current] + 1
             if tentative_g_score < g_score[neighbor]:
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_g_score
                 f_score[neighbor] = g_score[neighbor] + heuristic(neighbor, end)
                 heappush(open_set, (f_score[neighbor], neighbor))
-    
+
     return None  # No path found
     
 
