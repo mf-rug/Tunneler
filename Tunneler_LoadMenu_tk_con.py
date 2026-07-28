@@ -1631,6 +1631,11 @@ def tunneler_dialog():
         _sph_cache_clear()
         _sph_obj_cache_clear()   # new positions -> drop .obj geometry cache
         _shape_cache_clear()
+        # Also wipe any leftover axis/slice objects from a previous prediction: they
+        # carry stale coordinates and, worse, a lingering NNN_axis would be taken for
+        # the new tunnel's axis by on_diameter's existence check (feeding old In/Out
+        # positions into the slice).
+        DelObj('???_axis ???_slice')
 
         Tunneler(target=re.findall(r"\d+(?=:)", target_option.get())[0], ignore_res=[listbox.get(i) for i in listbox.curselection()],
                  ignore_surface=ign_surf_scale_chk.get(), 
