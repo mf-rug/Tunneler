@@ -779,7 +779,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
             print('Warning: Possibly unexpected visualization. An image was detected that cannot be deleted because you are using the free version of Yasara.')
         DelImage(1)
 
-    DelObj(f'{target}excluded {target}TPolygon? {target}Cl????????? {target}roughsurf {target}Close2Surf {target}tnlAAsurf {target}Close2Prot {target}Surf {target}SS {target}NonProt {target}H2O CenterHlp Du {target}excl_pts {target}CutPlane ???_shape ???_Sphere CntrOfRot')
+    DelObj(f'{target}excluded {target}TPolygon? {target}Cl????????? {target}roughsurf {target}Close2Surf {target}tnlAAsurf {target}Close2Prot {target}Surf {target}SS {target}NonProt {target}H2O CenterHlp Du {target}excl_pts {target}CutPlane ???_shape ???_Sphere ???_sphere shpV??? shpA??? shpM??? sphT??? sphD??? CntrOfRot')
 
     # Create dummy objects to fill gaps in the object number list.
     # YASARA's RenumberObj needs consecutive slots; dummies are deleted at the end.

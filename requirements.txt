@@ -20,6 +20,8 @@
 numpy==2.4.4
 scipy==1.17.1
 scikit-learn==1.8.0
+# scikit-image: marching cubes for the 'MergeSph' (merged-spheres) tunnel shape.
+scikit-image==0.26.0
 shapely==2.0.4
 # matplotlib must be >=3.9.2 for Tcl/Tk 9 support (older versions fail with
 # "ImportError: Failed to load Tcl_SetVar" on the tkagg backend).

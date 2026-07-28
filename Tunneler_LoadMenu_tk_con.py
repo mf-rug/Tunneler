@@ -106,15 +106,21 @@ def _attach_elapsed_timer(win):
     timer_label = ttk.Label(win, text="00:00")
     timer_label.pack(pady=(0, 5))
     timer_start = time.perf_counter()
+    def _set_label():
+        el = int(time.perf_counter() - timer_start)
+        timer_label.config(text=f'{el // 60:02d}:{el % 60:02d}')
     def _tick():
         try:
             if not win.winfo_exists():
                 return
-            el = int(time.perf_counter() - timer_start)
-            timer_label.config(text=f'{el // 60:02d}:{el % 60:02d}')
+            _set_label()
             win.after(250, _tick)
         except tk.TclError:
             return
+    # Manual tick for work that runs on the MAIN thread (e.g. the sphere build), where
+    # the tk event loop is blocked so after() never fires -- the worker calls this + an
+    # update_idletasks() to keep the clock moving.
+    win._elapsed_manual = _set_label
     win.after(0, _tick)
 
 
@@ -197,6 +203,76 @@ def _load_sphere_mesh(centers, radius, color, alpha, level):
     finally:
         if os.path.exists(path):
             os.remove(path)
+
+
+def _load_polygon_mesh(verts, faces, norms, color, alpha):
+    """LoadWOb an arbitrary triangle mesh given in global coords as one single-colour
+    object, applying the same LoadWOb compensation as _load_sphere_mesh (pre-flip z,
+    reverse winding, open='No', PosObj(0,0,0)). Returns the object number."""
+    V = verts.copy(); V[:, 2] *= -1
+    N = norms.copy(); N[:, 2] *= -1
+    F = faces[:, ::-1] + 1
+    fd, path = tempfile.mkstemp(suffix='.obj', prefix='ts'); os.close(fd)
+    try:
+        with open(path, 'wb') as f:
+            _write_obj_rows(f, V, 'v %.3f %.3f %.3f\n')
+            _write_obj_rows(f, N, 'vn %.3f %.3f %.3f\n')
+            _write_obj_rows(f, np.repeat(F, 2, axis=1), 'f %d//%d %d//%d %d//%d\n')
+        obj = LoadWOb(path, color=color, alpha=alpha, open='No')[0]
+        PosObj(obj, 0, 0, 0)
+        return obj
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def _skimage_missing():
+    """True if scikit-image (needed for the MergeSph shape's marching cubes) is not
+    importable -- lets the GUI show a helpful message instead of crashing."""
+    import importlib.util
+    return importlib.util.find_spec('skimage') is None
+
+
+def _union_shape_mesh(centers, colors, radius, alpha, voxel=0.3, smooth=0.8):
+    """'Merged spheres' surface: the union of balls of `radius` around `centers`,
+    extracted with marching cubes over a signed-distance grid (dist-to-nearest-centre
+    minus radius) built with cKDTree. Each surface vertex takes the colour of its
+    nearest centre, so it follows the tunnel/distance colouring; triangles are grouped
+    by colour into per-colour LoadWOb meshes and joined into one object (returned), or
+    None if the selection yields no surface. Cheap: ~0.3-0.5s for a several-k-point
+    tunnel. `smooth` Gaussian-blurs the grid for a rounder (metaball-like) blob; `voxel`
+    trades surface detail against cost."""
+    from skimage import measure                       # in the venv; imported lazily
+    centers = np.asarray(centers, float).reshape(-1, 3)
+    colors = np.asarray(colors)
+    if len(centers) == 0:
+        return None
+    margin = radius + 2 * voxel
+    lo = centers.min(0) - margin; hi = centers.max(0) + margin
+    ax = [np.arange(lo[d], hi[d], voxel) for d in range(3)]
+    gx, gy, gz = np.meshgrid(*ax, indexing='ij')
+    pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
+    tree = cKDTree(centers)
+    sdf = (tree.query(pts)[0] - radius).reshape(gx.shape)
+    if smooth > 0:
+        from scipy.ndimage import gaussian_filter
+        sdf = gaussian_filter(sdf, smooth)
+    try:
+        verts, faces, norms, _ = measure.marching_cubes(sdf, level=0.0, spacing=(voxel, voxel, voxel))
+    except (ValueError, RuntimeError):
+        return None
+    verts = verts + lo
+    fcol = colors[tree.query(verts)[1]][faces[:, 0]].astype(int)   # face colour = nearest-centre colour of its 1st vertex
+    objs = []
+    for cv in np.unique(fcol):
+        fsub = faces[fcol == cv]
+        used = np.unique(fsub)
+        loc = np.searchsorted(used, fsub)              # remap to a compact per-colour submesh
+        objs.append(_load_polygon_mesh(verts[used], loc, norms[used], int(cv), alpha))
+    NameObj(' '.join(str(x) for x in objs), 'mshape')
+    j = ListObj('mshape')[0]
+    JoinObj('mshape', j, center='No')
+    return j
 
 
 def tunneler_dialog():
@@ -303,7 +379,8 @@ def tunneler_dialog():
         SwitchObj(ListObj(f'{tar}Cl???????')[:5], "ON")
         transf_and_fix_ss(tar)
         DelObj('???_sphere ???_shape')
-        _sph_cache_clear()   # new clusters -> any stashed sphere sets are stale
+        _sph_cache_clear()     # new clusters -> any stashed sphere sets are stale
+        _shape_cache_clear()   # ... and any stashed shape (surface) sets
         # Recluster recreated the clusters (freshly coloured by tunnel) and invalidated
         # any distance colouring. Drop the whole distance cache (selection + colour +
         # signature) and reflect the reality in the GUI: select the 'Tunnel' colour mode
@@ -527,9 +604,12 @@ def tunneler_dialog():
                     frac = (done + bounds[i + 1]) / total_spheres * 100
                     progress_var.set(frac)
                     percent_label.config(text=f'{frac:.0f}%')
-                    # build runs on the main thread (see show_progress_spheres); repaint
-                    # the progress bar without processing input events (no reentrancy).
-                    try: progress_window.update_idletasks()
+                    # build runs on the main thread (see show_progress_spheres); tick the
+                    # elapsed clock manually (after() is blocked) and repaint without
+                    # processing input events (no reentrancy).
+                    try:
+                        progress_window._elapsed_manual()
+                        progress_window.update_idletasks()
                     except Exception: pass
             done = done + len(p)
 
@@ -680,13 +760,16 @@ def tunneler_dialog():
             HideMessage()
             Wait(1)
             if ListObj('???_shape') != []:
-                atomlist = ListAtom(f'obj ???_shape')
-                collist = [x[1:] for x in SegAtom(f'obj {tar}Cl???????')]
-                if len(atomlist) == len(collist):
-                    group_and_color(atomlist, collist)
+                if shape_surf_option.get() == 'MergeSph':
+                    Shapes(new=True)   # merged-sphere shape is a mesh (no atoms) -> rebuild
                 else:
-                    ShowMessage('Problem occured: ???_shape and Cl?????? objects do not have the same number of atoms. Try deleting shapes and recreate.')
-                    Wait('Continuebutton')
+                    atomlist = ListAtom(f'obj ???_shape')
+                    collist = [x[1:] for x in SegAtom(f'obj {tar}Cl???????')]
+                    if len(atomlist) == len(collist):
+                        group_and_color(atomlist, collist)
+                    else:
+                        ShowMessage('Problem occured: ???_shape and Cl?????? objects do not have the same number of atoms. Try deleting shapes and recreate.')
+                        Wait('Continuebutton')
             recolor_spheres_for_mode('distance')   # mesh spheres bake in colour -> swap/rebuild set
             Console("hidden")
             return
@@ -783,13 +866,16 @@ def tunneler_dialog():
                 SegAtom(sel, f'c{col}')
 
         if ListObj('???_shape') != []:
-            atomlist = ListAtom(f'obj ???_shape')
-            collist = [x[1:] for x in SegAtom(f'obj {tar}Cl???????')]
-            if len(atomlist) == len(collist):
-                group_and_color(atomlist, collist)
+            if shape_surf_option.get() == 'MergeSph':
+                Shapes(new=True)   # merged-sphere shape is a mesh (no atoms) -> rebuild
             else:
-                ShowMessage('Problem occured: ???_shape and Cl?????? objects do not have the same number of atoms. Try deleting shapes and recreate.')
-                Wait('Continuebutton')
+                atomlist = ListAtom(f'obj ???_shape')
+                collist = [x[1:] for x in SegAtom(f'obj {tar}Cl???????')]
+                if len(atomlist) == len(collist):
+                    group_and_color(atomlist, collist)
+                else:
+                    ShowMessage('Problem occured: ???_shape and Cl?????? objects do not have the same number of atoms. Try deleting shapes and recreate.')
+                    Wait('Continuebutton')
 
         for i in range(0, len(save_pairs), 2):
             PairObj(tar, save_pairs[i], save_pairs[i + 1])
@@ -1115,6 +1201,12 @@ def tunneler_dialog():
 
         _attach_elapsed_timer(progress_window)
 
+        # A fresh prediction rebuilds the clusters -> drop any stashed sphere/shape cache
+        # sets (objects + state), else stale shpV/A/M### / sphT/D### objects linger and a
+        # stale signature could cause a false cache hit.
+        _sph_cache_clear()
+        _shape_cache_clear()
+
         Tunneler(target=re.findall(r"\d+(?=:)", target_option.get())[0], ignore_res=[listbox.get(i) for i in listbox.curselection()],
                  ignore_surface=ign_surf_scale_chk.get(), 
                  ball_spacing=ball_spacing_scale_chk.get(),
@@ -1296,49 +1388,151 @@ def tunneler_dialog():
     label4.configure(text = 'size')
     label4.place(anchor="nw", x=90, y=109)
 
+    # --- Shape (surface) type cache ---------------------------------------------
+    # Building a shape (esp. MergeSph, which runs marching cubes) is worth caching:
+    # switching between VdW / accessible / MergeSph stashes the inactive set hidden
+    # (renamed shpV###/shpA###/shpM###, not matching '???_shape') and swaps it back
+    # instead of rebuilding, as long as its signature is unchanged. MergeSph bakes its
+    # colour into the mesh, so its signature includes the colour state; VdW/accessible
+    # recolour cheaply in place, so theirs excludes colour and they are just recoloured
+    # on swap-in.
+    _shape_state = {'surf': None, 'sig': {}}
+    _SHAPE_SUF = {'VdW': 'V', 'accessible': 'A', 'MergeSph': 'M'}
+
+    def _shape_sig(surf):
+        sig = f'{surf}|a{shape_alpha_chk.get()}'
+        if surf == 'MergeSph':
+            sig += f'|r{rad_chk.get()}|c{radio_col_var.get()}'
+            if radio_col_var.get() == 'distance':
+                tar = target(); sig += f'|{PairObj(tar, "dist_sel")}|{PairObj(tar, "dist_sig")}'
+            else:
+                sig += f'|s{step_entry.get()}'
+        return sig
+
+    def _shape_cache_clear():
+        DelObj('shpV??? shpA??? shpM???')
+        _shape_state['surf'] = None
+        _shape_state['sig'] = {}
+
+    def _recolor_active_shape():
+        """Recolour the visible atom-based ???_shape set (VdW/accessible) to the current
+        colour mode. Colours ONLY the shapes -- deliberately NOT via Colorbytunnel, which
+        also recolours clusters and (via recolor_spheres_for_mode) would drop the sphere
+        cache. MergeSph is not recoloured here (its colour is baked into the mesh)."""
+        if radio_col_var.get() == 'tunnel':
+            try:
+                step = int(step_entry.get())
+            except (ValueError, TypeError):
+                step = 25
+            # colour by cluster POSITION (matches detection + balls/spheres), not obj number
+            for i, objnum in enumerate(ListObj(f'{target()}Cl???????')):
+                if ListObj(f'{objnum:03d}_shape') != []:
+                    ColorObj(f'{objnum:03d}_shape', (i + 1) * step)
+        else:
+            atomlist = ListAtom(f'obj ???_shape')
+            collist = [x[1:] for x in SegAtom(f'obj {target()}Cl???????')]
+            if len(atomlist) == len(collist):
+                group_and_color(atomlist, collist, mind_console=False)
+            else:
+                ShowMessage('Problem occured: ???_shape and Cl?????? objects do not have the same number of atoms. Try deleting shapes and recreate.')
+                wc()
+
+    def build_shape_objects(surf):
+        """Build the ???_shape set for surface type `surf` from the current clusters."""
+        tunnel_objs = ListObj(f'{target()}Cl???????')
+        if surf == 'MergeSph':
+            # Merged-spheres surface: numpy union-of-balls (marching cubes), coloured
+            # per-vertex by nearest cluster point so it follows the current tunnel/
+            # distance colouring (mesh has no atoms -> no post-recolor).
+            radius = rad_chk.get() / 100 * 2.5
+            for targetobj in tunnel_objs:
+                ShowMessage(f"Creating merged-sphere shape of tunnel {NameObj(targetobj)[0]}")
+                Wait(1)
+                on_off = SwitchObj(targetobj)[0]
+                p = np.array(PosAtom(f'obj {targetobj}', coordsys='global')).reshape(-1, 3)
+                col = np.array(ColorAtom(f'obj {targetobj}'))
+                j = _union_shape_mesh(p, col, radius, shape_alpha_chk.get())
+                if j is None:
+                    continue
+                SwitchObj(j, on_off)
+                NameObj(j, f'{targetobj:03d}_shape')
+                PairObj(f'{targetobj:03d}_shape', 'surf', 'MergeSph')
+        else:
+            for targetobj in tunnel_objs:
+                ShowMessage(f"Creating shape of tunnel {NameObj(targetobj)[0]}")
+                Wait(1)
+                newo = DuplicateObj(targetobj)[0]
+                HideObj(newo)
+                SwapAtom(f'obj {newo}', 'H')
+                ShowSurfObj(newo, surf, outcol='atomcol', outalpha=shape_alpha_chk.get())
+                HideObj(newo)
+                NameObj(newo, f'{targetobj:03d}_shape')
+                on_off = SwitchObj(targetobj)[0]
+                SwitchObj(newo, on_off)
+                PairObj(newo, 'surf', surf)
+            # recolor because swapatom resets color, imperfect. change if swapatom keepcol becomes avail.
+            _recolor_active_shape()
+
     def Shapes(*args, new=False):
-        """Switch tunnel display to surface-shape mode (molecular/VdW/accessible surface)."""
-        start_time = time.perf_counter()
+        """Switch tunnel display to surface-shape mode (VdW / accessible / MergeSph),
+        caching each surface type so switching between them swaps instead of rebuilding."""
+        if radio_var.get() != 'shape':
+            # the surface-type dropdown's trace fires whenever it changes, even when the
+            # Shape representation isn't selected -- don't touch the current display then.
+            return
         Console("OFF")
-        cur_surf = PairObj('???_shape', 'surf')
-        if cur_surf == [] or cur_surf[0] == '' or cur_surf[0] != shape_surf_option.get():
-            new = True
-        if ListObj('???_shape') != [] and new == False:
+        surf = shape_surf_option.get()
+        tsig = _shape_sig(surf)
+        cur = _shape_state['surf']
+        # per-tunnel visibility of the current shape set, to carry across swap/rebuild
+        shapes_on = list(zip(ListObj('???_shape', format='OBJNAME'), SwitchObj('???_shape')))
+        # Which tunnels are currently shown (from whichever representation is active), so
+        # the shapes inherit that -- reading cluster visibility alone fails when coming
+        # from Spheres (clusters are hidden while spheres are shown).
+        on_nums = set(f'{o:03d}' for o, v in zip(ListObj(f'{target()}Cl???????'),
+                                                 SwitchObj(f'{target()}Cl???????')) if v == 'On')
+        if not on_nums:
+            on_nums = set(nm.split('_')[0] for nm, v in
+                          zip(NameObj('???_Sphere'), SwitchObj('???_Sphere')) if v == 'On')
+        if not on_nums and shapes_on:
+            on_nums = set(nm.split('_')[0] for nm, v in shapes_on if v == 'On')
+
+        if not new and cur == surf and _shape_state['sig'].get(surf) == tsig and ListObj('???_shape') != []:
+            # already showing the requested shape set: just switch on the visible tunnels
             on_tunnels = [x for x,y in zip(ListObj(f'{target()}Cl???????'), SwitchObj(f'{target()}Cl???????')) if y == 'On']
             if len(on_tunnels) == 0:
                 on_tunnels = [int(x[2:3]) for x,y in zip(NameObj('???_Sphere'), SwitchObj('???_Sphere')) if y == 'On']
             SwitchObj(" ".join([str(f'{x:03d}') + '_shape' for x in on_tunnels]), "on")
         else:
-            shapes_on = zip(ListObj('???_shape', format='OBJNAME'), SwitchObj('???_shape'))
-            DelObj('???_shape')
-            tunnel_objs = ListObj(f'{target()}Cl???????')
-            for targetobj in tunnel_objs:
-                ShowMessage(f"Creating shape of tunnel {NameObj(targetobj)[0]}")
-                Wait(1)
-                new = DuplicateObj(targetobj)[0]
-                HideObj(new)
-                SwapAtom(f'obj {new}', 'H')
-                ShowSurfObj(new, shape_surf_option.get(), outcol='atomcol', outalpha=shape_alpha_chk.get())
-                HideObj(new)
-                NameObj(new, f'{targetobj:03d}_shape')
-                on_off = SwitchObj(targetobj)[0]
-                SwitchObj(new, on_off)
-                PairObj(new, 'surf', shape_surf_option.get())
-            for obj, on_off in shapes_on:
-                SwitchObj(obj, on_off)
-
-            # recolor because swapatom resets color, imperfect. change if swapatom keepcol becomes avail.
-            if radio_col_var.get() == 'tunnel':
-                Colorbytunnel(shapes=True, mind_console=False)
+            # stash the current active set under its surf (unless forced rebuild / same surf)
+            if not new and cur is not None and cur != surf and ListObj('???_shape') != []:
+                for o in ListObj('???_shape'):
+                    num = NameObj(o)[0].split('_')[0]
+                    NameObj(o, f'shp{_SHAPE_SUF[cur]}{num}'); SwitchObj(o, 'Off')
             else:
-                atomlist = ListAtom(f'obj ???_shape')
-                collist = [x[1:] for x in SegAtom(f'obj {target()}Cl???????')]
-                if len(atomlist) == len(collist):
-                    group_and_color(atomlist, collist, mind_console=False)
+                DelObj('???_shape')
+            # bring up the target surf: cached set if its signature still matches, else build
+            if not new and _shape_state['sig'].get(surf) == tsig and ListObj(f'shp{_SHAPE_SUF[surf]}???') != []:
+                for o in ListObj(f'shp{_SHAPE_SUF[surf]}???'):
+                    num = NameObj(o)[0][3 + len(_SHAPE_SUF[surf]):]
+                    NameObj(o, f'{num}_shape'); SwitchObj(o, 'On')
+                if surf != 'MergeSph':
+                    _recolor_active_shape()   # colour excluded from VdW/acc sig -> recolour now
+            else:
+                DelObj(f'shp{_SHAPE_SUF[surf]}???')   # stale cache for this surf
+                if surf == 'MergeSph' and _skimage_missing():
+                    ShowMessage("MergeSph shape needs the 'scikit-image' package in the YASARA "
+                                "venv. Install it (pip install scikit-image) or rerun setup_venv.sh.")
+                    Wait('Continuebutton')
                 else:
-                    ShowMessage('Problem occured: ???_shape and Cl?????? objects do not have the same number of atoms. Try deleting shapes and recreate.')
-                    wc()
-        
+                    build_shape_objects(surf)
+                    _shape_state['sig'][surf] = tsig
+            # show the new/swapped shapes for exactly the tunnels that were visible before
+            for o in ListObj('???_shape'):
+                num = NameObj(o)[0].split('_')[0]
+                SwitchObj(o, 'On' if num in on_nums else 'Off')
+            _shape_state['surf'] = surf
+
         SwitchObj(f'{target()}Cl??????? ???_sphere', 'off')
         HideMessage()
         Wait(1)
@@ -1351,7 +1545,7 @@ def tunneler_dialog():
     #  Tunnel AA backbone atom type
     shape_surf_option = tk.StringVar()
     shape_surf_option.set("molecular")
-    shape_surf_dropdown = ttk.OptionMenu(tab2_appear, shape_surf_option, "VdW", "VdW", "accessible")
+    shape_surf_dropdown = ttk.OptionMenu(tab2_appear, shape_surf_option, "VdW", "VdW", "accessible", "MergeSph")
     shape_surf_dropdown.place(anchor="nw", width=100, height=27, x=85, y=127)
 
     shape_surf_option.trace_add("write", Shapes)
@@ -1616,13 +1810,19 @@ def tunneler_dialog():
             step = 25
             step_entry.delete(0, tk.END)
             step_entry.insert(0, 25)
+        # Colour by the cluster's POSITION i (0-based), matching detection's
+        # `ColorObj(c, (i+1)*25)` -- NOT the object number, which drifts from the
+        # detection colours (points/balls/spheres) and shifted the shape colouring.
         if not shapes:
-            for objnum in objs:
-                ColorObj(objnum, (objnum +1) * step)            
+            for i, objnum in enumerate(objs):
+                ColorObj(objnum, (i +1) * step)
         else:
-            for objnum in objs:
-                ColorObj(objnum, (objnum +1) * step)
-                ColorObj(str(f'{objnum:03d}') + '_shape', (objnum +1) * step)
+            for i, objnum in enumerate(objs):
+                ColorObj(objnum, (i +1) * step)
+                if shape_surf_option.get() != 'MergeSph':
+                    ColorObj(str(f'{objnum:03d}') + '_shape', (i +1) * step)
+            if shape_surf_option.get() == 'MergeSph' and ListObj('???_shape') != []:
+                Shapes(new=True)   # merged-sphere shape is a mesh (no atoms) -> rebuild
         recolor_spheres_for_mode('tunnel')   # mesh spheres bake in colour -> swap/rebuild set
         HideMessage()
         Wait(1)
