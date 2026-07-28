@@ -66,6 +66,88 @@ def rescale_floats_to_range(float_list, min_int, max_int, min_float=None, max_fl
     scaled_list = [int((x - min_float) / (max_float - min_float) * (max_int - min_int) + min_int) for x in float_list]
     return scaled_list
 
+
+# Distance-gradient palettes. Two kinds:
+#   ('hue',  [native YASARA colour numbers])  -- a plain 0-360 wheel sweep (wheel: 0/360=
+#       blue, 60=magenta, 120=red, 180=yellow, 240=green, 300=cyan; >360 keeps a sweep
+#       monotonic since n == n+360). Exact + fast, strip matches atoms.
+#   ('cmap', 'matplotlib-name')  -- a real perceptual colormap, sampled to hex and passed
+#       to ColorAtom. Hex carries NO performance penalty (the ColorPar "slowdown" warning
+#       is only about changing DEFAULT scheme colours; per-atom ColorAtom always uses
+#       YASARA's fast texture engine). YASARA snaps hex to its displayable gamut -- which
+#       importantly includes the GRAY CIRCLE, so desaturated/diverging palettes (coolwarm's
+#       near-white centre) render, impossible on the pure wheel. It has no dark/lightness
+#       axis though, so very dark colours snap imperfectly -- hence _CMAP trims the extremes.
+DIST_PALETTES = {
+    'Rainbow':   ('hue',  [120, 300]),   # native 0-360 sweep: red -> yellow -> green -> cyan
+    'Viridis':   ('cmap', 'viridis'),
+    'Plasma':    ('cmap', 'plasma'),
+    'Turbo':     ('cmap', 'turbo'),
+    'Cool-Warm': ('cmap', 'coolwarm'),
+    'Spectral':  ('cmap', 'Spectral'),
+}
+DIST_BANDS = 128                 # gradient quantisation; also caps ColorAtom calls/tunnel
+                                 # and keeps the cache's 'c<band>' segment tag <= 4 chars
+_CMAP_LO, _CMAP_HI = 0.05, 0.95  # trim colormap dark extremes (snap poorly / can wrap hue)
+_CMAP_CACHE = {}
+# Above this many tunnel points, the points/balls distance recolour (the group_and_color
+# loop) is slow enough (~seconds) to warrant the progress popup; below it recolours fast
+# enough that a popup would just flicker. Spheres/shapes always get the popup.
+_RECOLOR_POPUP_MIN = 50000
+
+
+def _palette_num(stops, t):
+    """Interpolate a 'hue' palette (list of native YASARA colour numbers) at fraction t in
+    [0,1], piecewise-linear across evenly-spaced stops."""
+    if t <= 0:
+        return stops[0]
+    if t >= 1:
+        return stops[-1]
+    seg = t * (len(stops) - 1)
+    i = int(seg)
+    f = seg - i
+    return stops[i] * (1 - f) + stops[i + 1] * f
+
+
+def _get_cmap(name):
+    cm = _CMAP_CACHE.get(name)
+    if cm is None:
+        try:
+            import matplotlib
+            cm = matplotlib.colormaps[name]      # matplotlib >= 3.5
+        except Exception:
+            import matplotlib.pyplot as _plt
+            cm = _plt.get_cmap(name)             # older fallback
+        _CMAP_CACHE[name] = cm
+    return cm
+
+
+def _cmap_rgb255(name, u):
+    """Sample a matplotlib colormap at u in [0,1] (trimmed to [_CMAP_LO,_CMAP_HI]) ->
+    (r,g,b) ints 0-255."""
+    uu = _CMAP_LO + max(0.0, min(1.0, u)) * (_CMAP_HI - _CMAP_LO)
+    r, g, b, _a = _get_cmap(name)(uu)
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+def _palette_color(name, u):
+    """Colour spec for palette `name` at fraction u in [0,1], ready for ColorAtom: a native
+    YASARA hue int for a 'hue' palette, or an 'rrggbb' hex string for a matplotlib cmap."""
+    kind, spec = DIST_PALETTES[name]
+    if kind == 'hue':
+        return int(round(_palette_num(spec, u)))
+    return '%02x%02x%02x' % _cmap_rgb255(spec, u)
+
+
+def _ycolor(cv):
+    """Coerce one colour cell to a value ColorAtom/LoadWOb accept: pass a hex string
+    ('rrggbb') through unchanged, coerce anything numeric to a plain int (native wheel/gray
+    colour). The distinction is by TYPE (str vs number), never by parsing -- a hex like
+    '440154' is all-digits-looking but must NOT be read as the decimal 440154."""
+    if isinstance(cv, str) or isinstance(cv, np.str_):
+        return str(cv)
+    return int(cv)
+
 # Verify the scientific stack is present AND functional before importing it.
 # ensure_dependencies() diagnoses the running Python (rejects YASARA's bundled
 # 'epy'), functionally probes each dependency (a bare `import matplotlib` misses
@@ -407,17 +489,25 @@ def _union_shape_mesh(centers, colors, radius, alpha, voxel=0.3, smooth=0.8,
         except (ValueError, RuntimeError):
             return None
         verts = verts + lo
+        # Our SDF is negative *inside* the balls, positive outside; marching_cubes'
+        # default gradient_direction='descent' assumes the object is the higher-valued
+        # region, so it returns inward-pointing normals -> the shape gets lit from
+        # behind (dark/desaturated) while every other rep lights outward. Flip to
+        # outward so shading matches the sphere reps and the rest of the scene.
+        norms = -norms
         if geom_cache is not None:
             geom_cache[geom_key] = (geom_frame, verts, faces, norms)
-    # colour the (possibly cached) geometry by the CURRENT colours
+    # colour the (possibly cached) geometry by the CURRENT colours. `colors` may hold hex
+    # strings (cmap palette) or ints (hue/tunnel) -- keep them as-is (no int cast) and
+    # coerce per-mesh via _ycolor, so LoadWOb (RGBCOLOR) gets a valid colour either way.
     tree = cKDTree(centers)
-    fcol = colors[tree.query(verts)[1]][faces[:, 0]].astype(int)   # face colour = nearest-centre colour of its 1st vertex
+    fcol = colors[tree.query(verts)[1]][faces[:, 0]]   # face colour = nearest-centre colour of its 1st vertex
     objs = []
     for cv in np.unique(fcol):
         fsub = faces[fcol == cv]
         used = np.unique(fsub)
         loc = np.searchsorted(used, fsub)              # remap to a compact per-colour submesh
-        objs.append(_load_polygon_mesh(verts[used], loc, norms[used], int(cv), alpha))
+        objs.append(_load_polygon_mesh(verts[used], loc, norms[used], _ycolor(cv), alpha))
     NameObj(' '.join(str(x) for x in objs), 'mshape')
     j = ListObj('mshape')[0]
     JoinObj('mshape', j, center='No')
@@ -493,8 +583,33 @@ def tunneler_dialog():
     def Recluster():
         """Re-run DBSCAN clustering on the current tunnel points (Tab 2 action)."""
         Console("OFF")
-        ShowMessage('Reclustering, please wait.')
-        Wait(1)
+        # Progress-bar popup, like the tunnel/sphere builds. The work is all on the main
+        # thread (YASARA object creation), so the bar is pumped manually via _bump():
+        # milestones for the fixed phases plus a live 15->80% ramp fed by the per-cluster
+        # progress_cb inside cluster_tunnel_points_dbscan (the visibly slow part).
+        global progress_window, progress_var, percent_label
+        progress_window = tk.Toplevel(root)
+        progress_window.title("Reclustering")
+        progress_window.lift()
+        progress_window.attributes("-topmost", True)
+        progress_var = tk.IntVar()
+        ttk.Progressbar(progress_window, orient="horizontal", length=200,
+                        mode="determinate", variable=progress_var, maximum=100).pack(padx=5, pady=20)
+        percent_label = ttk.Label(progress_window, text="0%")
+        percent_label.pack(pady=5)
+        _attach_elapsed_timer(progress_window)
+        progress_window.update()
+
+        def _bump(pct, note=''):
+            try:
+                progress_var.set(int(pct))
+                percent_label.config(text=f'{note} ({int(pct)}%)' if note else f'{int(pct)}%')
+                progress_window._elapsed_manual()
+                progress_window.update_idletasks()
+            except tk.TclError:
+                pass
+
+        _bump(5, 'preparing')
         tar = target()
         # check if the user used the hide surface atom slider to hide some points
         if ListObj(f'{tar}excl_pts') != [] or CountAtom(f'obj {tar}Cl???????') > CountAtom(f'obj {tar}Cl??????? visible'):
@@ -518,12 +633,16 @@ def tunneler_dialog():
             
         get_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tunneler_config.ini'))
         points = np.array(PosAtom(f'Obj {target()}Cl???????', coordsys='global')).reshape(-1,3)
+        _bump(15, 'clustering')
         # Use the LIVE slider values for the clustering thresholds so Recluster
         # reflects the current settings (min cluster volume + connect cutoff).
         # ball_spacing stays the STORED value the cloud was generated with:
         # Recluster re-thresholds the existing points, it does not regenerate them.
+        # progress_cb ramps the bar 15->80% as per-cluster objects are built.
         cluster_tunnel_points_dbscan(tar, points, min_vol_scale_chk.get(), float(ball_spacing),
-                                     connect_cut_scale_chk.get(), recluster=True)
+                                     connect_cut_scale_chk.get(), recluster=True,
+                                     progress_cb=lambda f: _bump(15 + 65 * f, 'building clusters'))
+        _bump(82, 'fixing structure')
         SwitchObj(f'{tar}Cl????????', "OFF")
         SwitchObj(ListObj(f'{tar}Cl???????')[:5], "ON")
         transf_and_fix_ss(tar)
@@ -531,6 +650,7 @@ def tunneler_dialog():
         _sph_cache_clear()     # new clusters -> any stashed sphere sets are stale
         _sph_obj_cache_clear() # ... and the point positions changed -> drop .obj geometry cache
         _shape_cache_clear()   # ... and any stashed shape (surface) sets
+        _bump(90, 'finalizing')
         # Recluster recreated the clusters (freshly coloured by tunnel) and invalidated
         # any distance colouring. Drop the whole distance cache (selection + colour +
         # signature) and reflect the reality in the GUI: select the 'Tunnel' colour mode
@@ -540,9 +660,14 @@ def tunneler_dialog():
         PairObj(tar, 'dist_sig', '')
         radio_col_var.set('tunnel')
         button18.configure(text='select')
+        _bump(93, 'computing distances')
         # Recluster changed the cluster set -> refresh the slider's precomputed distances.
         _precompute_surf_dist(tar)
-        HideMessage()
+        _bump(100, 'done')
+        try:
+            progress_window.destroy()
+        except tk.TclError:
+            pass
         Wait(1)
         Console("hidden")
 
@@ -792,7 +917,7 @@ def tunneler_dialog():
             SwitchObj(targetobj, 'Off')
             DelObj('sphere')   # clear stray temp meshes only; the OLD tunnel mesh stays until swapped
             p = np.array(PosAtom(f'obj {targetobj}', coordsys='global')).reshape(-1, 3)
-            col = np.array(ColorAtom(f'obj {targetobj}'))
+            col = _cluster_colors(targetobj)   # band-sourced (uniform type) in distance mode
 
             # One polygon-mesh object per distinct colour (LoadWOb takes a single
             # colour), each renamed 'sphere'; grouping keeps the whole build to a
@@ -803,7 +928,7 @@ def tunneler_dialog():
             bounds = list(starts) + [len(col_s)]
             for i, cv in enumerate(uniq):
                 fpath = os.path.join(_SPH_OBJ_DIR, f'sph_{mode_tag}_{targetobj:03d}_{i}.obj')
-                o = _load_sphere_mesh(p_s[bounds[i]:bounds[i + 1]], radius, int(cv),
+                o = _load_sphere_mesh(p_s[bounds[i]:bounds[i + 1]], radius, _ycolor(cv),
                                       alpha, sphere_level, path=fpath, reuse=reuse,
                                       normals=smooth_normals)
                 NameObj(o, 'sphere')
@@ -865,14 +990,20 @@ def tunneler_dialog():
     # currently on disk (see _sph_geo_sig / the geometry cache in build_sphere_objects).
     _sph_state = {'mode': None, 'sig': {}, 'geo': None}
     _SPH_SUF = {'tunnel': 'T', 'distance': 'D'}
+    # When set, a sphere rebuild inside recolor_spheres_for_mode drives the progress popup
+    # created by _recolor_with_progress (used for the slow distance recolour in sphere mode).
+    _recolor_prog = {'on': False}
 
     def _sph_sig(mode):
-        """Signature of a sphere set: rebuild is needed whenever this changes."""
+        """Signature of a sphere set: rebuild is needed whenever this changes. In distance
+        mode this includes the palette + handle window (they change the baked-in colours),
+        so switching palette forces a rebuild instead of a false 'already correct' hit."""
         base = f'r{rad_chk.get()}|a{alpha_chk.get()}'
         if mode == 'tunnel':
             return f'tunnel|{base}|s{step_entry.get()}'
         tar = target()
-        return f'distance|{base}|{PairObj(tar, "dist_sel")}|{PairObj(tar, "dist_sig")}'
+        return (f'distance|{base}|{PairObj(tar, "dist_sel")}|{PairObj(tar, "dist_sig")}'
+                f'|{dist_palette_var.get()}|{dist_grad["t0"]:.3f}|{dist_grad["t1"]:.3f}')
 
     def _obj_frame_sig(objs):
         """Compact signature of objects' current position+orientation (PosOriObj). Mesh
@@ -893,7 +1024,13 @@ def tunneler_dialog():
         if mode == 'tunnel':
             return f'tunnel|{base}|{frame}'
         tar = target()
-        return f'distance|{base}|{PairObj(tar, "dist_sel")}|{PairObj(tar, "dist_sig")}|{frame}'
+        # Distance-mode sphere .obj files are grouped BY COLOUR, and the palette/window
+        # decide both the colours AND the argsort order that indexes those files -- so
+        # unlike the point cache (which keys on the palette-independent bands via dist_sig),
+        # the geometry cache MUST include the palette + handle window, or a palette switch
+        # would reuse a file whose colour-group no longer matches.
+        return (f'distance|{base}|{PairObj(tar, "dist_sel")}|{PairObj(tar, "dist_sig")}'
+                f'|{dist_palette_var.get()}|{dist_grad["t0"]:.3f}|{dist_grad["t1"]:.3f}|{frame}')
 
     def _sph_cache_clear():
         """Invalidate the colour-mode stash (does NOT touch the .obj geometry files,
@@ -926,7 +1063,7 @@ def tunneler_dialog():
             if _sph_state['sig'].get(mode) == tsig:
                 HideMessage(); Wait(1); Console("hidden"); return   # already correct
             DelObj('???_sphere')
-            build_sphere_objects(force_show=True)
+            build_sphere_objects(force_show=True, progress=_recolor_prog['on'])
         else:
             if cur is not None and ListObj('???_sphere') != []:     # stash outgoing set
                 for o in ListObj('???_sphere'):
@@ -938,28 +1075,70 @@ def tunneler_dialog():
                     NameObj(o, f'{num}_sphere'); SwitchObj(o, 'On')
             else:
                 DelObj(f'sph{_SPH_SUF[mode]}???')                    # stale -> rebuild
-                build_sphere_objects(force_show=True)
+                build_sphere_objects(force_show=True, progress=_recolor_prog['on'])
         _sph_state['mode'] = mode
         _sph_state['sig'][mode] = tsig
         SwitchObj(f'{target()}Cl???????', 'off')
         SwitchObj('???_shape', 'off')
         HideMessage(); Wait(1); Console("hidden")
 
+    def _dist_bands(disto, mind, maxd):
+        """Quantise distances to band indices 0..DIST_BANDS-1 (normalised to [mind,maxd]).
+        Bands are palette/window-INDEPENDENT -- they're what gets cached in SegAtom, so a
+        palette or handle change just remaps bands->colour without recomputing distances."""
+        d = np.asarray(disto, float)
+        span = (maxd - mind) or 1.0
+        tn = np.clip((d - mind) / span, 0.0, 1.0)
+        return np.rint(tn * (DIST_BANDS - 1)).astype(int).tolist()
+
+    def _band_color(b):
+        """Map a band index to the current palette's colour (native int or 'rrggbb' hex),
+        applying the handle sub-window [t0,t1]."""
+        t0, t1 = dist_grad['t0'], dist_grad['t1']
+        u = t0 + (b / (DIST_BANDS - 1)) * (t1 - t0)
+        return _palette_color(dist_palette_var.get(), max(0.0, min(1.0, u)))
+
+    def _cluster_colors(targetobj):
+        """Per-point colour specs for a cluster's atoms, used to bake the sphere/shape
+        meshes. In distance mode we derive them from the cached BANDS via _band_color -- a
+        uniform-typed array (all hex for a cmap palette, all int for hue) -- rather than
+        reading ColorAtom back (which returns YASARA's snapped hex/gray-circle MIX and would
+        break grouping/int-casts). Otherwise (tunnel mode) the atoms' own int colours."""
+        if radio_col_var.get() == 'distance':
+            segs = SegAtom(f'obj {targetobj}')
+            if segs and all(s[:1] == 'c' and s[1:].isdigit() for s in segs):
+                return np.array([_band_color(int(s[1:])) for s in segs], dtype=object)
+        return np.array(ColorAtom(f'obj {targetobj}'))
+
     def group_and_color(atomlist, collist, mind_console=True):
-        """Batch-color atoms by grouping them by color first (much faster than per-atom calls)."""
+        """Batch-colour atoms grouped by their distance BAND (far faster than per-atom).
+        collist holds band indices (as stored in SegAtom 'c<band>'); each is mapped to the
+        current palette's colour via _band_color, so a palette/window change recolours
+        instantly from the cached bands, no distance recompute.
+
+        Drives the recolour progress popup (per band group) when it's active -- this is the
+        dominant cost of a points/balls recolour. Skipped in sphere mode, where the sphere
+        BUILD drives the bar instead (so it doesn't get filled twice)."""
         if mind_console:
             Console("OFF")
         from collections import defaultdict
-        # Create a dictionary to store the grouped items
         grouped_items = defaultdict(list)
-
-        # Group items from atomlist based on values in collist
-        for atoms, col in zip(atomlist, collist):
-            grouped_items[col].append(atoms)
-
-        # Iterate over the grouped items and call ColorAtom
-        for col, atoms in grouped_items.items():
-            ColorAtom(" ".join(str(x) for x in atoms), col)
+        for atoms, band in zip(atomlist, collist):
+            grouped_items[band].append(atoms)
+        tick = _recolor_prog['on'] and radio_var.get() != 'spheres'
+        items = list(grouped_items.items())
+        n = len(items)
+        for k, (band, atoms) in enumerate(items):
+            ColorAtom(" ".join(str(x) for x in atoms), _band_color(int(band)))
+            if tick and n:
+                try:
+                    pct = (k + 1) / n * 100
+                    progress_var.set(pct)
+                    percent_label.config(text=f'{pct:.0f}%')
+                    progress_window._elapsed_manual()
+                    progress_window.update_idletasks()
+                except Exception:
+                    pass
 
           
     def Colorbytunneldist(shapes=True, prompt_if_unset=True):
@@ -992,14 +1171,13 @@ def tunneler_dialog():
         # selection and silently did nothing.
         save_pairs = PairObj(tar)
         dist_col = PairObj(tar, 'dist_col')
-        # The cached colours depend not only on the reference atom but also on the
-        # scaling mode ('calc per tunnel' vs global) and the colour range. Key the
-        # cache on all of them: otherwise toggling 'calc per tunnel' (or changing the
-        # colours) silently reuses the stale colouring instead of recomputing.
+        # What gets cached in SegAtom is the distance BAND per atom, which depends only on
+        # the reference atom (dist_sel==dist_col) and the scaling mode ('calc per tunnel'
+        # normalises per tunnel vs globally) -- NOT on the palette or handle window (those
+        # are applied at band->colour time). So the signature keys on per_tunnel only, and
+        # a palette/handle change takes the fast cache path below (remap, no recompute).
         per_tunnel = pertun_chk.get()
-        min_color = color1_entry.get()
-        max_color = color2_entry.get()
-        cur_sig = f'{int(per_tunnel)}|{min_color}|{max_color}'
+        cur_sig = f"{int(per_tunnel)}"
         if dist_col != [] and dist_sel == dist_col and PairObj(tar, 'dist_sig') == [cur_sig]:
             atomlist = ListAtom(f'obj {tar}Cl???????')
             collist = [x[1:] for x in SegAtom(f'obj {tar}Cl???????')]
@@ -1010,13 +1188,7 @@ def tunneler_dialog():
                 if shape_surf_option.get() == 'MergeSph':
                     Shapes(new=True)   # merged-sphere shape is a mesh (no atoms) -> rebuild
                 else:
-                    atomlist = ListAtom(f'obj ???_shape')
-                    collist = [x[1:] for x in SegAtom(f'obj {tar}Cl???????')]
-                    if len(atomlist) == len(collist):
-                        group_and_color(atomlist, collist)
-                    else:
-                        ShowMessage('Problem occured: ???_shape and Cl?????? objects do not have the same number of atoms. Try deleting shapes and recreate.')
-                        Wait('Continuebutton')
+                    _color_shapes_from_clusters()   # colours (auto-rebuilds if out of sync)
             recolor_spheres_for_mode('distance')   # mesh spheres bake in colour -> swap/rebuild set
             Console("hidden")
             return
@@ -1095,34 +1267,28 @@ def tunneler_dialog():
                 mind = min(disto)
                 maxd = max(disto)
             
-            all_cols = rescale_floats_to_range(disto, int(min_color), int(max_color), mind, maxd)
-            
-            # Group atoms by their integer colour and issue one ColorAtom + one
-            # SegAtom per colour instead of per atom. Exact (every atom keeps its own
-            # all_cols[i]) and effectively flat in atom count: per-atom ColorAtom
-            # degrades superlinearly on large tunnels because each single-atom
-            # selection is re-resolved against the whole object (~558s vs ~0.4s at
-            # 488k points). The SegAtom stores the colour so an unchanged reference
-            # is reused via the cache path at the top of this function.
+            all_bands = _dist_bands(disto, mind, maxd)
+
+            # Group atoms by their distance BAND and issue one ColorAtom + one SegAtom per
+            # band instead of per atom. Batched (per-atom ColorAtom degrades superlinearly
+            # on large tunnels -- each single-atom selection is re-resolved against the whole
+            # object, ~558s vs ~0.4s at 488k points), and bounded at DIST_BANDS groups. The
+            # SegAtom stores the band ('c<band>', palette-independent) so an unchanged
+            # reference is reused via the fast cache path at the top of this function -- a
+            # palette/handle change just remaps bands->colour there, no distance recompute.
             grouped = defaultdict(list)
-            for atom, col in zip(atomlist, all_cols):
-                grouped[int(col)].append(atom)
-            for col, atoms in grouped.items():
+            for atom, band in zip(atomlist, all_bands):
+                grouped[band].append(atom)
+            for band, atoms in grouped.items():
                 sel = " ".join(str(x) for x in atoms)
-                ColorAtom(sel, col)
-                SegAtom(sel, f'c{col}')
+                ColorAtom(sel, _band_color(band))
+                SegAtom(sel, f'c{band}')
 
         if ListObj('???_shape') != []:
             if shape_surf_option.get() == 'MergeSph':
                 Shapes(new=True)   # merged-sphere shape is a mesh (no atoms) -> rebuild
             else:
-                atomlist = ListAtom(f'obj ???_shape')
-                collist = [x[1:] for x in SegAtom(f'obj {tar}Cl???????')]
-                if len(atomlist) == len(collist):
-                    group_and_color(atomlist, collist)
-                else:
-                    ShowMessage('Problem occured: ???_shape and Cl?????? objects do not have the same number of atoms. Try deleting shapes and recreate.')
-                    Wait('Continuebutton')
+                _color_shapes_from_clusters()   # colours (auto-rebuilds if out of sync)
 
         for i in range(0, len(save_pairs), 2):
             PairObj(tar, save_pairs[i], save_pairs[i + 1])
@@ -1752,7 +1918,9 @@ def tunneler_dialog():
         if surf == 'MergeSph':
             sig = f'{surf}|a{shape_alpha_chk.get()}|r{rad_chk.get()}|c{radio_col_var.get()}'
             if radio_col_var.get() == 'distance':
-                tar = target(); sig += f'|{PairObj(tar, "dist_sel")}|{PairObj(tar, "dist_sig")}'
+                tar = target()
+                sig += (f'|{PairObj(tar, "dist_sel")}|{PairObj(tar, "dist_sig")}'
+                        f'|{dist_palette_var.get()}|{dist_grad["t0"]:.3f}|{dist_grad["t1"]:.3f}')
             else:
                 sig += f'|s{step_entry.get()}'
             return sig
@@ -1792,13 +1960,7 @@ def tunneler_dialog():
                 if ListObj(f'{objnum:03d}_shape') != []:
                     ColorObj(f'{objnum:03d}_shape', (i + 1) * step)
         else:
-            atomlist = ListAtom(f'obj ???_shape')
-            collist = [x[1:] for x in SegAtom(f'obj {target()}Cl???????')]
-            if len(atomlist) == len(collist):
-                group_and_color(atomlist, collist, mind_console=False)
-            else:
-                ShowMessage('Problem occured: ???_shape and Cl?????? objects do not have the same number of atoms. Try deleting shapes and recreate.')
-                wc()
+            _color_shapes_from_clusters()   # colours (auto-rebuilds if out of sync)
 
     def build_shape_objects(surf):
         """Build the ???_shape set for surface type `surf` from the current clusters."""
@@ -1813,7 +1975,7 @@ def tunneler_dialog():
                 Wait(1)
                 on_off = SwitchObj(targetobj)[0]
                 p = np.array(PosAtom(f'obj {targetobj}', coordsys='global')).reshape(-1, 3)
-                col = np.array(ColorAtom(f'obj {targetobj}'))
+                col = _cluster_colors(targetobj)   # band-sourced (uniform type) in distance mode
                 j = _union_shape_mesh(p, col, radius, shape_alpha_chk.get(),
                                       geom_cache=_mrg_geom_cache,
                                       geom_key=(int(targetobj), rad_chk.get()),
@@ -1838,6 +2000,33 @@ def tunneler_dialog():
                 PairObj(newo, 'surf', surf)
             # recolor because swapatom resets color, imperfect. change if swapatom keepcol becomes avail.
             _recolor_active_shape()
+
+    _shape_sync = {'busy': False}
+
+    def _color_shapes_from_clusters():
+        """Colour the atom-based ???_shape set from the cluster point colours, paired 1:1.
+
+        If the shape set has drifted out of sync with the clusters (their total atom counts
+        differ -- e.g. stale shapes lingering after the clusters changed), AUTO-RECOVER by
+        rebuilding the shapes fresh from the current clusters, instead of raising the old
+        'delete shapes and recreate' error at the user. Re-entrancy-guarded: if even a fresh
+        rebuild can't reconcile the counts, it degrades to a quiet no-op rather than looping
+        (build_shape_objects calls back here to colour what it just built)."""
+        tar = target()
+        atomlist = ListAtom('obj ???_shape')
+        collist = [x[1:] for x in SegAtom(f'obj {tar}Cl???????')]
+        if len(atomlist) == len(collist):
+            group_and_color(atomlist, collist, mind_console=False)
+            return
+        if _shape_sync['busy']:
+            return   # a rebuild is already in progress and still doesn't match -> give up quietly
+        _shape_sync['busy'] = True
+        try:
+            DelObj('???_shape')
+            _shape_cache_clear()                          # drop any stashed (now-stale) shape sets
+            build_shape_objects(shape_surf_option.get())  # rebuild fresh from clusters (+ recolours)
+        finally:
+            _shape_sync['busy'] = False
 
     def Shapes(*args, new=False):
         """Switch tunnel display to surface-shape mode (VdW / accessible / MergeSph),
@@ -1983,10 +2172,18 @@ def tunneler_dialog():
         """
         Console("OFF")
         tar = target()
-        SwitchObj('???_spheres ???_shape', 'OFF')
-        if radio_var.get() == 'spheres':
+        # Neither the sphere meshes nor the MergeSph/VdW shapes can be partially hidden
+        # (they are monolithic LoadWOb/surface meshes, not per-atom), so a surface-points
+        # change can't update them live -- drop to the native, per-atom-hideable ball rep.
+        # Balls() reads which sphere/shape objects are currently *on* to know which tunnels
+        # to show, so it must run BEFORE those meshes get switched off (it turns them off
+        # itself). Doing a blanket SwitchObj('...','OFF') first would hide the shapes and
+        # leave nothing visible -- which was the Shape-mode bug.
+        if radio_var.get() in ('spheres', 'shape'):
             radio_var.set('balls')
             Balls()
+        else:
+            SwitchObj('???_Sphere ???_shape', 'OFF')
         _precompute_surf_dist(tar)
         cache = surf_dist_cache.get(tar)
         if cache is None:
@@ -2085,27 +2282,6 @@ def tunneler_dialog():
         "cyan": 300,
         "gray": None,
     }
-    def col_to_num(hue, grey='g'):
-        """Convert a color name or hue string to a YASARA numeric hue value."""
-        Console("OFF")
-        if isinstance(hue, str):
-            hue_lower = hue.lower()
-            if hue_lower in color_names:
-                hue = color_names[hue_lower]
-                if hue is None:  # Special handling for grey
-                    return grey  # return special
-            else:
-                try:
-                    # Attempt to convert string to a number
-                    hue = int(hue)
-                except ValueError:
-                    plugin.end()
-            return hue
-        elif isinstance(hue, int) or isinstance(hue, float):
-            return int(hue)
-        else:
-            plugin.end()
-        
 
     def get_contrasting_text_color(hex_color):
         """Return black or white hex color for readable text on the given background."""
@@ -2135,6 +2311,93 @@ def tunneler_dialog():
         r, g, b = colorsys.hsv_to_rgb(adjusted_hue / 360, 1, 1)
         hex_color = "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
         return hex_color
+
+    def _palette_rgb(name, u):
+        """'#rrggbb' for the strip preview at fraction u. 'hue' palettes match the rendered
+        atoms exactly; cmaps show their TRUE colours while the atoms get YASARA's nearest
+        displayable snap, so they can differ a little (mainly at dark extremes)."""
+        kind, spec = DIST_PALETTES[name]
+        if kind == 'hue':
+            return hue_to_rgb(_palette_num(spec, u))
+        return '#%02x%02x%02x' % _cmap_rgb255(spec, u)
+
+    def _make_gradient_picker(parent, x, y, width, height, get_rgb, grad, on_change):
+        """A slim in-tkinter strip that renders the CURRENTLY selected palette (see
+        DIST_PALETTES) as a gradient, with two draggable handles that trim the sub-window
+        [t0,t1] (fractions 0-1) of the palette actually used for the distance colouring.
+        Default handles at the ends = full palette. `get_rgb(u)` returns the '#rrggbb' of the
+        active palette at fraction u in [0,1]; `grad` is a {'t0','t1'} dict updated in place;
+        the recolour `on_change` fires on handle release (caller debounces it).
+        Returns repaint(), to call when the palette changes."""
+        cv = tk.Canvas(parent, width=width, height=height, highlightthickness=1,
+                       highlightbackground='#888888', cursor='sb_h_double_arrow')
+        cv.place(anchor='nw', x=x, y=y)
+        img = tk.PhotoImage(width=width, height=height)   # keep referenced vs GC
+        cv._grad_img = img
+        cv.create_image(0, 0, anchor='nw', image=img)
+        # Bright bars along top+bottom edges bracket the selected [t0,t1] sub-window.
+        # (Highlight rather than dim the rest: stipple fake-transparency is unreliable on
+        # macOS Aqua Tk.) Then the two handle markers.
+        # Top: an arrow from the near handle (t0) to the far handle (t1) -- shows the
+        # gradient DIRECTION (which the two handle positions alone don't), so the swap
+        # button visibly flips it. Drawn as a black halo + white arrow so it stays visible
+        # over any palette colour. Bottom: a plain bracket over the selected window.
+        bar_top_sh = cv.create_line(0, 3, 0, 3, fill='black', width=4,
+                                    arrow='last', arrowshape=(8, 9, 4))
+        bar_top = cv.create_line(0, 3, 0, 3, fill='white', width=2,
+                                 arrow='last', arrowshape=(7, 8, 3))
+        bar_bot = cv.create_line(0, height - 1, 0, height - 1, fill='white', width=3)
+        h0_w = cv.create_line(0, 0, 0, height, fill='white', width=3)
+        h0_b = cv.create_line(0, 0, 0, height, fill='black', width=1)
+        h1_w = cv.create_line(0, 0, 0, height, fill='white', width=3)
+        h1_b = cv.create_line(0, 0, 0, height, fill='black', width=1)
+
+        def _fx(t):
+            return max(0, min(width, int(t * width)))
+
+        def _redraw():
+            x0, x1 = _fx(grad['t0']), _fx(grad['t1'])
+            lo, hi = min(x0, x1), max(x0, x1)
+            cv.coords(bar_top_sh, x0, 3, x1, 3)   # black halo under the arrow
+            cv.coords(bar_top, x0, 3, x1, 3)      # near(t0) -> far(t1)
+            cv.coords(bar_bot, lo, height - 1, hi, height - 1)
+            for item, xx in ((h0_w, x0), (h0_b, x0), (h1_w, x1), (h1_b, x1)):
+                cv.coords(item, xx, 0, xx, height)
+
+        def repaint():
+            # Repaint the palette gradient (call on palette switch) and redraw the handles.
+            for px in range(width):
+                img.put(get_rgb(px / (width - 1)), to=(px, 0, px + 1, height))
+            _redraw()
+        repaint()
+
+        drag = {'which': None}
+
+        def _t_at(ex):
+            return max(0.0, min(1.0, ex / width))
+
+        def _press(e):
+            # grab whichever handle is nearer the click, then move it there
+            drag['which'] = 't0' if abs(e.x - _fx(grad['t0'])) <= abs(e.x - _fx(grad['t1'])) else 't1'
+            _move(e)
+
+        def _move(e):
+            # Update only the strip visual while dragging -- the (expensive) recolour is
+            # deferred to release so it doesn't fire on every motion event / mid-drag pause.
+            if drag['which'] is None:
+                return
+            grad[drag['which']] = _t_at(e.x)
+            _redraw()
+
+        def _release(e):
+            if drag['which'] is None:
+                return
+            drag['which'] = None
+            on_change()   # recolour once, after a settle delay (caller debounces this)
+        cv.bind('<Button-1>', _press)
+        cv.bind('<B1-Motion>', _move)
+        cv.bind('<ButtonRelease-1>', _release)
+        return repaint
 
 
     ss_chk = tk.BooleanVar(value=switch_status(f'{target()}SS'))  # Variable to track the checkbox status
@@ -2340,48 +2603,99 @@ def tunneler_dialog():
     checkbutton7.configure(text='calc per tunnel', variable=pertun_chk, command=on_pertun_toggle)
     checkbutton7.place(anchor="nw", x=90, y=182)
 
-    def choose_color():
-        Console("OFF")
-        color_code = ShowWin("ColorSelection","Select color for close atoms", "Bow","Background","100")
-        if color_code:
-            col = hue_to_rgb(color_code[0])
-            color1_entry.delete(0, tk.END)
-            color1_entry.insert(0, col_to_num(color_code[0]))
-            style.configure(style_name1, foreground=get_contrasting_text_color(col), background=col)
+    # Distance-gradient colouring: a palette (DIST_PALETTES: native-hue OR a real matplotlib
+    # colormap sampled to hex) chosen from a dropdown, rendered on an inline strip whose two
+    # handles trim the sub-window [t0,t1] used (default full = 0..1). Distances are cached as
+    # palette-independent BANDS (see _dist_bands/_band_color), so palette/handle changes just
+    # remap without recomputing distances.
+    dist_palette_var = tk.StringVar(value='Rainbow')
+    dist_grad = {'t0': 0.0, 't1': 1.0}   # handle sub-window over the palette
 
-    def choose_color2():
-        Console("OFF")
-        color_code = ShowWin("ColorSelection","Select color for distant atoms", "Bow","Background","100")
-        if color_code:
-            col = hue_to_rgb(color_code[0])
-            color2_entry.delete(0, tk.END)
-            color2_entry.insert(0, col_to_num(color_code[0]))
-            style.configure(style_name2, foreground=get_contrasting_text_color(col), background=col)
+    def _recolor_with_progress():
+        """Apply the distance recolour with a progress popup sized to how slow it'll be:
+          - points/balls: the group_and_color loop is ~seconds only on a DENSE tunnel, so a
+            determinate bar (ticked by group_and_color) shows only above a size threshold;
+            small tunnels recolour fast -> no popup (would just flicker).
+          - spheres: mesh rebuild, always a determinate bar (ticked by the sphere build).
+          - MergeSph shape: mesh rebuild with no per-step hook -> a static 'please wait' popup.
+        """
+        global progress_window, progress_var, percent_label
+        rep = radio_var.get()
+        is_mergesph = (rep == 'shape' and shape_surf_option.get() == 'MergeSph')
+        big = CountAtom(f'obj {target()}Cl???????') > _RECOLOR_POPUP_MIN
+        if rep in ('points', 'balls') and not big:
+            Colorbytunneldist(prompt_if_unset=False)   # fast enough -> no popup
+            return
+        progress_window = tk.Toplevel(root)
+        progress_window.title('Recolouring')
+        progress_window.lift(); progress_window.attributes('-topmost', True)
+        if is_mergesph:
+            ttk.Label(progress_window, text='Rebuilding shapes, please wait…').pack(padx=24, pady=18)
+        else:
+            progress_var = tk.IntVar()
+            ttk.Progressbar(progress_window, orient='horizontal', length=200,
+                            mode='determinate', variable=progress_var, maximum=100).pack(padx=10, pady=(14, 4))
+            percent_label = ttk.Label(progress_window, text='0%'); percent_label.pack(pady=(0, 8))
+            _attach_elapsed_timer(progress_window)
+        progress_window.update()
+        _recolor_prog['on'] = not is_mergesph
+        try:
+            Colorbytunneldist(prompt_if_unset=False)
+        finally:
+            _recolor_prog['on'] = False
+            try:
+                progress_window.destroy()
+            except tk.TclError:
+                pass
 
+    def _apply_dist_colors():
+        """Live-recolour when the palette/handles change -- only while colouring by distance
+        with a reference already chosen (never pops the atom picker)."""
+        if target() is None or radio_col_var.get() != 'distance' or PairObj(target(), 'dist_sel') == []:
+            return
+        _recolor_with_progress()
+    # Fires ~350 ms after a handle is released (recolour is on release, not per drag-motion),
+    # so the recolour reacts with a settle delay, not continuously during the drag.
+    _apply_dist_debounced = _make_debounced(_apply_dist_colors, delay=350)
 
-    # Use different style names for each entry
-    style = ttk.Style()
-    style_name1 = "Colored1.TEntry"
-    style.configure(style_name1, foreground="white", background=hue_to_rgb(100))
+    # Dropdown sits right of the 'calc per tunnel' checkbox (free space on that row); the
+    # full-width strip below renders the chosen palette, so no separate colour label needed.
+    palette_drop = ttk.OptionMenu(tab2_appear, dist_palette_var, 'Rainbow', *DIST_PALETTES.keys())
+    palette_drop.place(anchor="nw", x=192, y=181, width=110)
 
-    style_name2 = "Colored2.TEntry"
-    style.configure(style_name2, foreground="white", background=hue_to_rgb(380))
+    _grad_repaint = _make_gradient_picker(tab2_appear, x=90, y=205, width=163, height=16,
+                                          get_rgb=lambda u: _palette_rgb(dist_palette_var.get(), u),
+                                          grad=dist_grad, on_change=_apply_dist_debounced)
 
-    color1_entry = ttk.Entry(tab2_appear, style=style_name1)
-    color1_entry.place(anchor="nw", x=145, y=203, width=45)
-    color1_entry.insert(0, '100')
+    def _swap_gradient():
+        # Reverse the gradient direction: swap the near/far handle positions, redraw (the
+        # top arrow flips) and recolour. Common enough to warrant a one-click button.
+        dist_grad['t0'], dist_grad['t1'] = dist_grad['t1'], dist_grad['t0']
+        _grad_repaint()
+        _apply_dist_debounced()
+    # A tk.Label styled as a button, NOT ttk.Button: the macOS Aqua button clips its label
+    # when forced into a small height, showing only a sliver. A Label renders text at any
+    # size and honours bg/relief, so the arrow glyph is reliably visible.
+    swap_btn = tk.Label(tab2_appear, text='↔', relief='raised', bd=2,
+                        bg='#e6e6e6', fg='black', cursor='hand2', font=('TkDefaultFont', 13))
+    swap_btn.place(anchor="nw", x=257, y=204, width=46, height=19)
 
-    color2_entry = ttk.Entry(tab2_appear, style=style_name2)
-    color2_entry.place(anchor="nw", x=258, y=203, width=45)
-    color2_entry.insert(0, '380')
-           
-    button19 = ttk.Button(tab2_appear)
-    button19.configure(style='Toolbutton', text='Min col', command=choose_color)
-    button19.place(anchor="nw", x=90, y=203)
+    def _swap_press(_e):
+        swap_btn.config(relief='sunken')
 
-    button20 = ttk.Button(tab2_appear)
-    button20.configure(style='Toolbutton', text='Max col', command=choose_color2)
-    button20.place(anchor="nw", x=200, y=203)  
+    def _swap_release(_e):
+        swap_btn.config(relief='raised')
+        _swap_gradient()
+    swap_btn.bind('<ButtonPress-1>', _swap_press)
+    swap_btn.bind('<ButtonRelease-1>', _swap_release)
+
+    def _on_palette_change(*_):
+        # New palette -> repaint the strip and reset the handles to the full extent, then
+        # live-recolour (debounced) if we're currently colouring by distance.
+        dist_grad['t0'], dist_grad['t1'] = 0.0, 1.0
+        _grad_repaint()
+        _apply_dist_debounced()
+    dist_palette_var.trace_add('write', _on_palette_change)
 
     ### actions section
     label13 = ttk.Label(tab2_appear)
