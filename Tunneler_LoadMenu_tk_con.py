@@ -650,6 +650,7 @@ def tunneler_dialog():
         _sph_cache_clear()     # new clusters -> any stashed sphere sets are stale
         _sph_obj_cache_clear() # ... and the point positions changed -> drop .obj geometry cache
         _shape_cache_clear()   # ... and any stashed shape (surface) sets
+        _xsec_cache_clear()    # ... and the cached cross-section positions
         _bump(90, 'finalizing')
         # Recluster recreated the clusters (freshly coloured by tunnel) and invalidated
         # any distance colouring. Drop the whole distance cache (selection + colour +
@@ -990,6 +991,27 @@ def tunneler_dialog():
     # currently on disk (see _sph_geo_sig / the geometry cache in build_sphere_objects).
     _sph_state = {'mode': None, 'sig': {}, 'geo': None}
     _SPH_SUF = {'tunnel': 'T', 'distance': 'D'}
+
+    # Cross-section slider cache: a tunnel's point positions + atom numbers do NOT
+    # change while the diameter slider is dragged, so fetch them from YASARA once per
+    # tunnel selection instead of on every tick (PosAtom/ListAtom over all N points
+    # were the per-move O(N) hotspots at dense spacing). 'cutp' tracks the atoms marked
+    # as the 'cutp' segment last move, so SegAtom can be reset incrementally (O(k))
+    # rather than re-stamping all N points each move. Cleared on new prediction,
+    # recluster, and tunnel re-selection (see _xsec_cache_clear call-sites).
+    _xsec_cache = {'tnl': None, 'pos': None, 'atoms': None, 'cutp': None}
+
+    def _xsec_cache_clear():
+        _xsec_cache.update(tnl=None, pos=None, atoms=None, cutp=None)
+
+    def _xsec_get(tnl_name):
+        """(positions Nx3, atom-numbers) for a tunnel, cached across slider moves."""
+        if _xsec_cache['tnl'] != tnl_name or _xsec_cache['pos'] is None:
+            _xsec_cache['tnl'] = tnl_name
+            _xsec_cache['pos'] = np.array(PosAtom(f'Obj {tnl_name}', coordsys='global')).reshape(-1, 3)
+            _xsec_cache['atoms'] = np.array(ListAtom(f'Obj {tnl_name}'))
+            _xsec_cache['cutp'] = None   # nothing marked yet for this tunnel
+        return _xsec_cache['pos'], _xsec_cache['atoms']
     # When set, a sphere rebuild inside recolor_spheres_for_mode drives the progress popup
     # created by _recolor_with_progress (used for the slow distance recolour in sphere mode).
     _recolor_prog = {'on': False}
@@ -1631,6 +1653,7 @@ def tunneler_dialog():
         _sph_cache_clear()
         _sph_obj_cache_clear()   # new positions -> drop .obj geometry cache
         _shape_cache_clear()
+        _xsec_cache_clear()      # new points -> drop cached cross-section positions
         # Also wipe any leftover axis/slice objects from a previous prediction: they
         # carry stale coordinates and, worse, a lingering NNN_axis would be taken for
         # the new tunnel's axis by on_diameter's existence check (feeding old In/Out
@@ -2873,7 +2896,8 @@ def tunneler_dialog():
             initializing = False
         if initializing:
             return
-        Console("OFF") 
+        Console("OFF")
+        _xsec_cache_clear()   # different tunnel selected -> refetch its cross-section points
         if target() != None:
             targ = target()
             tnl_name = get_tnl_name()
@@ -3379,7 +3403,9 @@ def tunneler_dialog():
             fig, ax = plt.subplots()
 
         plane_points_pos = np.array(PosAtom(f'obj {slice_obj}', coordsys='global')).reshape(-1,3)
-        tnl_points_pos = np.array(PosAtom(f'Obj {tnl_name}', coordsys='global')).reshape(-1,3)
+        # Tunnel coords + atom numbers are cached across slider moves (they don't
+        # change during a drag) -> no per-move O(N) PosAtom/ListAtom round-trip.
+        tnl_points_pos, tnl_points = _xsec_get(tnl_name)
         ball_spacing = float(PairObj(target(), 'ball_spacing')[0])
         # Slab half-thickness for "points near the cutting plane". The old value
         # (ball_spacing / 800 ~ 0.0004 A) was far thinner than the point grid, so
@@ -3390,12 +3416,22 @@ def tunneler_dialog():
         threshold = ball_spacing / 2
         near_plane, near_indices, not_near_plane, not_near_indices = find_points_near_plane(tnl_points_pos, plane_points_pos, distance_threshold=threshold)
         if near_indices.size > 0:
-            tnl_points = np.array(ListAtom(f'Obj {tnl_name}'))
-            SegAtom(tnl_points, '.')
-            SegAtom(tnl_points[near_indices], 'cutp')
+            near_atoms = tnl_points[near_indices]
+            # Mark the 'cutp' segment incrementally: reset only what we marked last
+            # move (O(k)), not all N points. First touch of a tunnel does one full
+            # reset to clear any stale marks, then stays O(k) thereafter.
+            prev_cutp = _xsec_cache['cutp']
+            if prev_cutp is None:
+                SegAtom(tnl_points, '.')
+            elif len(prev_cutp):
+                SegAtom(prev_cutp, '.')
+            SegAtom(near_atoms, 'cutp')
+            _xsec_cache['cutp'] = near_atoms
             if cut_points_chk.get():
-                ShowAtom(tnl_points)
-                HideAtom(tnl_points[not_near_indices])
+                # Hide the whole object cheaply, then show only the near points (O(k)),
+                # rather than enumerating the huge not-near set in one HideAtom string.
+                HideObj(tnl_name)
+                ShowAtom(near_atoms)
 
             near_plane_points_projected, original_indices, plane_origin, u, v = project_points_onto_plane(near_plane, plane_points_pos)
 
@@ -3488,9 +3524,9 @@ def tunneler_dialog():
                 ax.xaxis.set_ticks_position('bottom')
                 ax.yaxis.set_ticks_position('left')
 
-                # Redraw the canvas
+                # Redraw the canvas (draw_idle coalesces rapid slider-driven redraws)
                 if on_canvas:
-                    canvas.draw()
+                    canvas.draw_idle()
                 else:
                     plt.show()
 
@@ -3501,7 +3537,7 @@ def tunneler_dialog():
             ax.clear()
             ax.set_title(f"tunnel crosssection area: 0 \u212B\u00b2")
             ax.axis('off')
-            canvas.draw()
+            canvas.draw_idle()
 
 
     def on_diameter(*args):
@@ -3510,7 +3546,6 @@ def tunneler_dialog():
             return
         Console('OFF')
         if tnl_insp_option.get() != 'All':
-            Wait(1)
             tnl_name = get_tnl_name()
 
             # if not existant, make axis:
