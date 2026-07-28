@@ -437,26 +437,25 @@ def tunneler_dialog():
                     if o == modulo_value:
                         modulo_value += 1000
                         jobj = ListObj('sphere')[0]
-                        # center='No' is critical: the default (Center=Yes) recomputes the
-                        # geometric center and shifts every vertex of the whole accumulating
-                        # object on each join -> O(N^2). With center='No' the join is a cheap
-                        # relabel, cutting sphere build ~4.5x at large tunnels (e.g. 47s->10s
-                        # for ~118k points). World positions are unchanged (spheres are already
-                        # PosObj'd to global coords); only the object's local rotation pivot moves,
-                        # which the plugin never uses.
+                        # center='No' avoids O(N^2) re-centering of the growing mesh on each join
+                        # (default Center=Yes shifts every vertex of the whole object per join).
                         JoinObj('sphere', jobj, center='No')
                         ShowMessage(f'Created {o:,} / {len(atomlist):,} spheres of tunnel {NameObj(targetobj)[0]}.')
                         Wait(1)
                         if progress:
                             progress_var.set((o + done) / total_spheres *100)
                             percent_label.config(text=f'{(o + done) / total_spheres *100:.0f}%')
+                            # build runs on the main thread (see show_progress_spheres); repaint
+                            # the progress bar without processing input events (no reentrancy).
+                            try: progress_window.update_idletasks()
+                            except Exception: pass
                 done = done + len(atomlist)
                 if progress:
                     progress_var.set(done / total_spheres *100)
                     percent_label.config(text=f'{done / total_spheres *100:.0f}%')
 
                 jobj = ListObj('sphere')[0]
-                JoinObj('sphere', jobj, center='No')   # see center='No' note above (avoids O(N^2) re-centering)
+                JoinObj('sphere', jobj, center='No')
                 SwitchObj(jobj, on_off)
                 NameObj('sphere', f'{targetobj:03d}_sphere')
 
@@ -1099,7 +1098,12 @@ def tunneler_dialog():
 
         _attach_elapsed_timer(progress_window)
 
-        threading.Thread(target=on_new_sphere, args=(new, True)).start()
+        # Run the sphere build on the MAIN thread, NOT a background thread: dispatching
+        # YASARA commands from a worker thread costs ~20s of GIL scheduling overhead at
+        # ~70k spheres (measured: between-call time 20.3s threaded vs 0.14s main-thread).
+        # The build loop keeps the progress bar live via progress_window.update_idletasks().
+        progress_window.update()
+        on_new_sphere(new, True)
 
 
     def on_new_sphere(new=False, progress=False):
