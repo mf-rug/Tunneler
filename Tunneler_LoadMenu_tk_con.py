@@ -564,10 +564,26 @@ def tunneler_dialog():
         Console("hidden")
 
     def Exit():
-        """Save scene and clean up on dialog exit."""
+        """Save an exit snapshot, cleaning up first. The derived sphere/shape MESH objects
+        can be hundreds of MB of triangles and make SaveSce slow, so drop them before
+        saving -- they rebuild from the clusters on demand. The tunnels are kept as points
+        (preserving which were visible) so a reopened scene still shows them."""
+        Console("OFF")
+        tar = target()
+        if tar is None:
+            Console("hidden")
+            return
+        # tunnels currently visible, from whichever rep is active (clusters when
+        # points/balls, meshes when spheres/shapes)
+        on_nums = set(f'{o:03d}' for o, v in
+                      zip(ListObj(f'{tar}Cl???????'), SwitchObj(f'{tar}Cl???????')) if v == 'On')
+        on_nums |= set(nm.split('_')[0] for nm, v in
+                       zip(NameObj('???_Sphere ???_shape'), SwitchObj('???_Sphere ???_shape')) if v == 'On')
+        DelObj('???_sphere ???_shape sphT??? sphD??? shpV??? shpA??? shpM???')
+        for o in ListObj(f'{tar}Cl???????'):
+            SwitchObj(o, 'On' if f'{o:03d}' in on_nums else 'Off')
         Console("hidden")
-        if target() != None:
-            SaveSce(f'{NameObj(target())[0]}_tunnels_exit.sce')
+        SaveSce(f'{NameObj(tar)[0]}_tunnels_exit.sce')
 
     def Balls():
         """Switch tunnel display to ball-stick mode."""
@@ -1051,8 +1067,19 @@ def tunneler_dialog():
 
     root = tk.Tk()
     root.title("Tunneler Customization Menu")
-    root.attributes("-topmost", True)  
+    root.attributes("-topmost", True)
     root.geometry(f"+{root.winfo_x()}+{int(root.winfo_y() +55)}")
+    # Route the window-manager close (X button) through the same clean shutdown as the
+    # Exit button, so it saves the scene and lets the plugin end properly instead of
+    # yanking the window out from under the mainloop.
+    root.protocol("WM_DELETE_WINDOW", on_cancel)
+    # macOS Cmd-Q hits Tk's Apple-menu Quit, which tears down the Tcl interpreter before
+    # atexit/WM_DELETE_WINDOW can run -> route it through on_cancel too. Harmless (and a
+    # no-op) on platforms without the mac-specific command.
+    try:
+        root.createcommand('::tk::mac::Quit', on_cancel)
+    except tk.TclError:
+        pass
 
     initializing = True
 
@@ -3239,7 +3266,26 @@ def tunneler_dialog():
     root.mainloop()
 
 
+# Tell YASARA the plugin has finished, exactly once, on every exit path. Without this
+# YASARA reports "The plugin stopped without notice ... forgot to call plugin.end". The
+# atexit backstop covers exits that don't return through the loop below (e.g. Cmd-Q,
+# window close), while the explicit call handles the normal case; the guard prevents a
+# double call. Errors are swallowed -- at this point the script is done regardless.
+import atexit as _atexit
+_plugin_ended = []
+def _end_plugin_once():
+    if _plugin_ended:
+        return
+    _plugin_ended.append(True)
+    try:
+        plugin.end()
+    except BaseException:
+        pass
+_atexit.register(_end_plugin_once)
+
 # Keep showing the dialog until the user clicks "Cancel"
 while tunneler_dialog():
     pass
+
+_end_plugin_once()
 
