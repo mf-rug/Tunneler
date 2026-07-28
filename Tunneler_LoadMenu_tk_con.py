@@ -185,7 +185,87 @@ def _write_obj_rows(f, arr, rowfmt, chunk=1000000):
         f.write(((rowfmt * len(blk)) % tuple(blk.ravel().tolist())).encode())
         i += chunk
 
-def _load_sphere_mesh(centers, radius, color, alpha, level, path=None, reuse=False):
+
+# --- Parallel .obj writer -----------------------------------------------------
+# Formatting millions of floats to ASCII is CPU-bound and GIL-held, so for big tunnels
+# the write is fanned out across worker subprocesses (each a run of Tunneler_meshwrite.py
+# -- a standalone script, NOT a multiprocessing.Pool: 'spawn' on macOS would re-execute
+# this whole plugin in every worker). Measured ~3-4x on a 118k-point tunnel. It always
+# falls back to the serial writer on any failure or below the size threshold.
+_PARALLEL_WRITE_MIN_VERTS = 800000                       # skip fan-out below this (spawn overhead)
+_WRITE_NPROC = min(12, max(2, (os.cpu_count() or 4) - 2))
+
+def _find_meshworker():
+    """Locate Tunneler_meshwrite.py. It sits beside this file; when the plugin is a
+    symlink in YASARA's plg/, realpath resolves to the real working-dir copy. Falls back
+    to cwd (plg/) for a copy-deploy. Returns (path, ok)."""
+    cands = []
+    for getter in (lambda: os.path.dirname(os.path.realpath(__file__)),
+                   os.getcwd,
+                   lambda: os.path.dirname(__file__)):
+        try:
+            cands.append(getter())
+        except Exception:
+            pass
+    for d in cands:
+        p = os.path.join(d, 'Tunneler_meshwrite.py')
+        if os.path.exists(p):
+            return p, True
+    return '', False
+
+_MESHWORKER, _MESHWORKER_OK = _find_meshworker()
+_WRITE_LAST = ['idle']   # actual mode of the most recent .obj write (for the build message)
+_WRITE_ERR = ['']        # reason the last parallel write fell back (for diagnostics)
+
+def _write_obj_parallel(path, sections, nproc=_WRITE_NPROC):
+    """Write an .obj at `path` from `sections` (list of (array, rowfmt)) using up to
+    `nproc` worker subprocesses that format row-slices in parallel; concatenate the parts
+    in order. Returns True on success, False (writing nothing) on any problem so the
+    caller can fall back to the serial writer. Temp files live beside `path`."""
+    import subprocess, base64
+    tmp, procs, parts = [], [], []
+    per = max(2, nproc // max(1, len(sections)))
+    _WRITE_ERR[0] = ''
+    try:
+        for si, (arr, fmt) in enumerate(sections):
+            npy = f'{path}.s{si}.npy'; np.save(npy, arr); tmp.append(npy)
+            n = len(arr); fb = base64.b64encode(fmt.encode()).decode()
+            bnd = [(n * j) // per for j in range(per + 1)]
+            for j in range(per):
+                if bnd[j] == bnd[j + 1]:
+                    continue
+                out = f'{path}.s{si}.{j}'; tmp.append(out); parts.append(out)
+                procs.append(subprocess.Popen(
+                    [sys.executable, _MESHWORKER, npy, str(bnd[j]), str(bnd[j + 1]), fb, out],
+                    stderr=subprocess.PIPE))
+        bad = None
+        for p in procs:
+            err = p.communicate()[1]
+            if p.returncode != 0 and bad is None:
+                bad = f'rc={p.returncode} {(err or b"").decode("utf-8", "replace").strip()[-160:]}'
+        if bad is not None:
+            _WRITE_ERR[0] = bad
+            return False
+        if not all(os.path.exists(x) for x in parts):
+            _WRITE_ERR[0] = 'part file(s) missing'
+            return False
+        with open(path, 'wb') as f:
+            for x in parts:
+                with open(x, 'rb') as g:
+                    shutil.copyfileobj(g, f)
+        return True
+    except Exception as e:
+        _WRITE_ERR[0] = repr(e)[:160]
+        return False
+    finally:
+        for x in tmp:
+            try:
+                os.remove(x)
+            except OSError:
+                pass
+
+def _load_sphere_mesh(centers, radius, color, alpha, level, path=None, reuse=False,
+                      normals=True):
     """Draw many equal-radius spheres of a SINGLE colour as one polygon-mesh object,
     built in numpy and imported via LoadWOb in a single call. This replaces ~2 YASARA
     calls per sphere (ShowSphere+PosObj) with one file load -> ~15x faster at large
@@ -198,6 +278,12 @@ def _load_sphere_mesh(centers, radius, color, alpha, level, path=None, reuse=Fal
         YASARA shades the spheres' dark interiors (they render near-black);
       * open='No' culls back faces -> matches ShowSphere's transparency density so the
         alpha slider maps 1:1 (no remap needed).
+
+    `normals=False` omits the per-vertex normals (and the 'f a//a ...' normal refs): it
+    ~halves the .obj write time and file size for big tunnels, at the cost of flat/faceted
+    sphere shading (YASARA falls back to per-face normals). Winding/backface-cull/alpha
+    are unaffected. Used only above a size threshold where the write dominates and the
+    spheres are too small/dense for the faceting to show.
 
     Geometry caching: `path`, when given, is a stable file to write the mesh to and
     keep (not a throwaway temp). If `reuse` is True and that file already exists, the
@@ -217,13 +303,31 @@ def _load_sphere_mesh(centers, radius, color, alpha, level, path=None, reuse=Fal
             Fr = Ft[:, ::-1]                        # reverse winding (z-reflection flipped it)
             n = len(C); vpr = len(Vr)
             verts = (C[:, None, :] + Vr[None, :, :] * radius).reshape(-1, 3)
-            norms = np.tile(Vr, (n, 1))
             faces = (Fr[None, :, :] + 1 + (np.arange(n) * vpr)[:, None, None]).reshape(-1, 3)
-            face6 = np.repeat(faces, 2, axis=1)     # 'f a//a b//b c//c' needs each index twice
-            with open(path, 'wb') as f:
-                _write_obj_rows(f, verts, 'v %.3f %.3f %.3f\n')
-                _write_obj_rows(f, norms, 'vn %.3f %.3f %.3f\n')
-                _write_obj_rows(f, face6, 'f %d//%d %d//%d %d//%d\n')
+            if normals:
+                norms = np.tile(Vr, (n, 1))
+                face6 = np.repeat(faces, 2, axis=1)       # 'f a//a b//b c//c' needs each index twice
+                sections = [(verts, 'v %.3f %.3f %.3f\n'),
+                            (norms, 'vn %.3f %.3f %.3f\n'),
+                            (face6, 'f %d//%d %d//%d %d//%d\n')]
+            else:
+                sections = [(verts, 'v %.3f %.3f %.3f\n'),
+                            (faces, 'f %d %d %d\n')]       # no normals -> flat shading
+            # Big meshes: fan the (CPU-bound) formatting across worker processes; small
+            # ones and any failure fall back to the single-threaded writer.
+            done = False
+            if not _MESHWORKER_OK:
+                _WRITE_LAST[0] = 'single-thread (worker not found)'
+            elif len(verts) < _PARALLEL_WRITE_MIN_VERTS:
+                _WRITE_LAST[0] = 'single-thread (small)'
+            else:
+                done = _write_obj_parallel(path, sections)
+                _WRITE_LAST[0] = (f'multithread x{_WRITE_NPROC}' if done
+                                  else f'single-thread (parallel failed: {_WRITE_ERR[0]})')
+            if not done:
+                with open(path, 'wb') as f:
+                    for arr, fmt in sections:
+                        _write_obj_rows(f, arr, fmt)
         obj = LoadWOb(path, color=color, alpha=alpha, open='No')[0]
         PosObj(obj, 0, 0, 0)
         return obj
@@ -646,8 +750,13 @@ def tunneler_dialog():
         sphere_level = next((lv for lv in (3, 2, 1, 0)
                              if total_spheres * _FACES[lv] <= 20000000), 0)
         _roundness = {0: 'low', 1: 'reduced', 2: 'high', 3: 'maximum'}[sphere_level]
+        # The .obj write dominates the build for big tunnels; the 'fast' checkbox drops
+        # per-vertex normals to ~halve it (flat shading via YASARA's per-face normals --
+        # brighter/flatter, best on the small dense spheres of a large tunnel).
+        smooth_normals = not fast_chk.get()
         ShowMessage(f"Creating {total_spheres:,} spheres at {_roundness} roundness "
-                    f"(level {sphere_level}/3, auto-set for the point count).")
+                    f"(level {sphere_level}/3"
+                    f"{'' if smooth_normals else ', flat shading (fast)'}).")
         Wait(1)
         radius = rad_chk.get() / 100 * 2.5
         alpha = alpha_chk.get()
@@ -660,10 +769,24 @@ def tunneler_dialog():
         mode_tag = 'd' if mode == 'distance' else 't'
         geo_sig = _sph_geo_sig(mode, sphere_level)
         reuse = (geo_sig == _sph_state.get('geo'))
+        _shade = 'smooth' if smooth_normals else 'flat/fast'
+        _vpr = len(_icosphere(sphere_level)[0])
+        _WRITE_LAST[0] = 'reusing cached geometry' if reuse else 'idle'
         done = 0
         for targetobj in tunnel_objs:
-            ShowMessage(f"Creating {CountAtom(f'Obj {targetobj}'):,} spheres of tunnel "
-                        f"{NameObj(targetobj)[0]} at {_roundness} roundness (level {sphere_level}/3)")
+            ns = CountAtom(f'Obj {targetobj}')
+            # intended write mode, shown live during the (possibly slow) build; the
+            # 'built' message afterwards reports what actually happened.
+            if reuse:
+                wmode = 'reusing cache'
+            elif not _MESHWORKER_OK:
+                wmode = 'single-thread (worker not found)'
+            elif ns * _vpr < _PARALLEL_WRITE_MIN_VERTS:
+                wmode = 'single-thread (small)'
+            else:
+                wmode = f'multithread ({_WRITE_NPROC}w)'
+            ShowMessage(f"Creating {ns:,} spheres of tunnel {NameObj(targetobj)[0]} at "
+                        f"{_roundness} roundness (level {sphere_level}/3, {_shade}, {wmode})")
             Wait(1)
             on_off = 'On' if force_show else prev_on.get(f'{targetobj:03d}', SwitchObj(targetobj)[0])
             SwitchObj(targetobj, 'Off')
@@ -681,7 +804,8 @@ def tunneler_dialog():
             for i, cv in enumerate(uniq):
                 fpath = os.path.join(_SPH_OBJ_DIR, f'sph_{mode_tag}_{targetobj:03d}_{i}.obj')
                 o = _load_sphere_mesh(p_s[bounds[i]:bounds[i + 1]], radius, int(cv),
-                                      alpha, sphere_level, path=fpath, reuse=reuse)
+                                      alpha, sphere_level, path=fpath, reuse=reuse,
+                                      normals=smooth_normals)
                 NameObj(o, 'sphere')
                 if progress:
                     frac = (done + bounds[i + 1]) / total_spheres * 100
@@ -762,8 +886,9 @@ def tunneler_dialog():
         and, for tunnel mode, the colour step (one block per tunnel regardless), so an
         alpha or tunnel-colour change is a cache HIT that skips the dominant file write.
         Radius and tessellation level DO change vertex data, so they're included, as does
-        the object frame (globals go stale on rotate/move -- see _obj_frame_sig)."""
-        base = f'r{rad_chk.get()}|L{level}'
+        the object frame (globals go stale on rotate/move -- see _obj_frame_sig) and the
+        'fast' flag (flat vs smooth changes what's written to the .obj)."""
+        base = f'r{rad_chk.get()}|L{level}|f{int(fast_chk.get())}'
         frame = _obj_frame_sig(ListObj(f'{target()}Cl???????'))
         if mode == 'tunnel':
             return f'tunnel|{base}|{frame}'
@@ -1591,6 +1716,17 @@ def tunneler_dialog():
     label4 = ttk.Label(tab2_appear)
     label4.configure(text = 'size')
     label4.place(anchor="nw", x=90, y=109)
+
+    fast_chk = tk.BooleanVar(value=False)   # off = smooth (per-vertex normals) by default
+    def _on_fast_toggle(*_):
+        """Toggle flat (fast) vs smooth sphere shading. It changes what's written to the
+        .obj (per-vertex normals), so it invalidates the geometry cache via _sph_geo_sig
+        and the rebuild rewrites. Only acts while spheres are the active view."""
+        if radio_var.get() == 'spheres' and ListObj('???_Sphere') != []:
+            show_progress_spheres()
+    fast_check = ttk.Checkbutton(tab2_appear, text='fast', variable=fast_chk,
+                                 command=_on_fast_toggle)
+    fast_check.place(anchor="nw", x=190, y=96)
 
     # --- Shape (surface) type cache ---------------------------------------------
     # Building a shape (esp. MergeSph, which runs marching cubes) is worth caching:
