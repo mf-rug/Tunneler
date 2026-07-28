@@ -332,10 +332,13 @@ CIF_CHUNK_COEF, CIF_CHUNK_MIN, CIF_CHUNK_MAX = 17, 5000, 50000
 def _adaptive_chunk(n):
     return int(min(CIF_CHUNK_MAX, max(CIF_CHUNK_MIN, round(CIF_CHUNK_COEF * n ** 0.5))))
 
-def load_cif_points(points, path_base, ori='right', center=False, correct=True, chunk=None):
+def load_cif_points(points, path_base, ori='right', center=False, correct=True, chunk=None, progress_cb=None):
     """Write a numpy point cloud to CIF and load it into YASARA as ONE object,
     chunking the CIF to avoid LoadCIF's O(N^2) single-file cost (see note above).
     `chunk=None` (default) auto-sizes the chunk to ~17*sqrt(N).
+
+    `progress_cb`, if given, is called with a 0..1 fraction after each chunk loads --
+    this is the dominant cost of a prediction, so it drives the tunnel-calc progress bar.
 
     Returns [objnum] (1-element list), matching LoadCIF's return so callers can
     index [0] or use the list directly.
@@ -355,11 +358,14 @@ def load_cif_points(points, path_base, ori='right', center=False, correct=True, 
         os.remove(path_base)
         return res
     objs = []
+    nchunks = (n + chunk - 1) // chunk
     for k, i in enumerate(range(0, n, chunk)):
         part = '{}.part{}'.format(path_base, k)
         write_cif_file(points[i:i + chunk], part, ori=ori)
         objs.append(LoadCIF(part, center=center, correct=correct)[0])
         os.remove(part)
+        if progress_cb is not None:
+            progress_cb((k + 1) / nchunks)
     if len(objs) > 1:
         JoinObj(' '.join(str(o) for o in objs), objs[0])
     return [objs[0]]
@@ -477,7 +483,7 @@ def _prefilter_inside_points(target, points, max_dist, ignore_res, margin=CIF_PR
 
 
 def point_clouder(target, ball_spacing, ignore_surface, keep_surf_points, surf_con_prev, build_polygon=False,
-                  prefilter_dist=None, ignore_res=None):
+                  prefilter_dist=None, ignore_res=None, progress_cb=None):
     """Build a point cloud that fills the interior of the protein.
 
     Steps:
@@ -499,7 +505,7 @@ def point_clouder(target, ball_spacing, ignore_surface, keep_surf_points, surf_c
     ddh_points = create_surrounding_points(pdb_points, ROUGH_SURF_SPACING)
     ddh_points = np.unique(np.round(ddh_points, 0), axis=0)
 
-    ddh = load_cif_points(ddh_points, PWD() + os.path.sep + f'{target}roughsurf.cif', ori='right', center=False, correct=True)
+    ddh = load_cif_points(ddh_points, PWD() + os.path.sep + f'{target}roughsurf.cif', ori='right', center=False, correct=True, progress_cb=progress_cb)
     MoveObj(ddh, z=OBJECT_Z_OFFSET)  # Shift off-screen so it doesn't interfere with the main view
     StickObj(ddh)
     ColorObj(ddh, 'white')
@@ -558,12 +564,15 @@ def point_clouder(target, ball_spacing, ignore_surface, keep_surf_points, surf_c
     return([outer_points, shape_points])
 
 
-def load_points_yasara(target, point_cloud, keep_exclusion):
+def load_points_yasara(target, point_cloud, keep_exclusion, progress_cb=None):
     """Load the numpy point cloud into YASARA as CIF dummy-atom objects.
 
     Creates '{target}inside' (tunnel candidate points) and optionally
     '{target}excluded' (outer shell points). Both are shifted Z-50 to keep
     them out of the main viewport.
+
+    `progress_cb` (0..1 per CIF chunk) drives the progress bar during the big
+    inside-points load -- the single most expensive step of a prediction.
     """
     Console("OFF")
     # keep excluded points at the surface as separate object
@@ -572,7 +581,7 @@ def load_points_yasara(target, point_cloud, keep_exclusion):
         MoveObj(outside_points,z=OBJECT_Z_OFFSET)
         NameObj(outside_points, f'{target}excluded')
 
-    inside_points = load_cif_points(point_cloud[1], os.path.join(PWD(), f'{target}inside.cif'), correct=True, center=False)[0]
+    inside_points = load_cif_points(point_cloud[1], os.path.join(PWD(), f'{target}inside.cif'), correct=True, center=False, progress_cb=progress_cb)[0]
     MoveObj(inside_points,z=OBJECT_Z_OFFSET)
 
     StickObj(f'{target}inside {target}outside')
@@ -614,7 +623,7 @@ def generate_tunnel_points(target, point_protein_distance, ignore_res, mds):
     return(points_to_cluster)
 
 
-def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_cut, recluster=False, start_time=None):
+def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_cut, recluster=False, start_time=None, progress_cb=None):
     """Cluster tunnel points using DBSCAN and create per-cluster YASARA objects.
 
     For each cluster above the minimum volume threshold:
@@ -668,6 +677,7 @@ def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_
 
     DelObj(f'{target}Cl???????A')
 
+    ncl = len(sorted_cluster_indices)
     for i, indices in enumerate(sorted_cluster_indices):
         c = DuplicateAtom(" ".join(str(i) for i in points_names[indices]))[0]
         NameObj(c, f"{target}Cl{int2let(c)}{len(indices):06d}")
@@ -679,6 +689,9 @@ def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_
         aa_obj = NameObj(c)[0] + 'A'
         NameObj(new, aa_obj)
         ShowObj(new)
+        # Optional GUI progress hook (Recluster's popup bar); harmless when None.
+        if progress_cb is not None:
+            progress_cb((i + 1) / ncl if ncl else 1.0)
 
     sort_objs(int(target))
     CenterAtom('All')
@@ -789,28 +802,32 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
 
     w('|   Starting tunnel analysis, please wait.')
 
-    if progress_var != None and percent_label != None:
-        progress_var.set(3)
-        percent_label.config(text=f'3%')
+    # --- Progress bar -------------------------------------------------------
+    # The bar advances by RAMPING each slow phase within a band proportional to its real
+    # cost, rather than a few coarse milestone jumps (which used to leave a dead 30->80
+    # gap). The two dominant phases -- loading the point cloud (CIF chunk loop) and
+    # clustering (per-cluster loop) -- get per-item callbacks so their bands fill
+    # smoothly; the monolithic YASARA ops between them just step to the next milestone.
+    # Runs in the Tunneler worker thread, so callbacks only set the IntVar/label; the main
+    # tk loop repaints (no update_idletasks() from a worker thread).
+    _has_prog = progress_var != None and percent_label != None
+    def _prog(pct):
+        if _has_prog:
+            progress_var.set(int(pct))
+            percent_label.config(text=f'{int(pct)}%')
+    def _band(lo, hi):
+        # Return a 0..1 -> [lo,hi] progress callback, or None when there is no bar.
+        return (lambda f: _prog(lo + (hi - lo) * f)) if _has_prog else None
 
+    _prog(2)
     point_cloud = point_clouder(target, ball_spacing=ball_spacing, ignore_surface=ignore_surface, keep_surf_points=keep_surf_points, surf_con_prev=surf_con_prev, build_polygon=build_pol,
-                                prefilter_dist=(max_ball_protein if mds == 0 else None), ignore_res=ignore_res)
-
-    if progress_var != None and percent_label != None:
-        progress_var.set(10)
-        percent_label.config(text=f'10%')
-
-    load_points_yasara(target, point_cloud, keep_exclusion = keep_surf_points)
-
-    if progress_var != None and percent_label != None:
-        progress_var.set(20)
-        percent_label.config(text=f'20%')
-
-    points_to_cluster = generate_tunnel_points(target, point_protein_distance = max_ball_protein, ignore_res=ignore_res, mds=mds)
-
-    if progress_var != None and percent_label != None:
-        progress_var.set(30)
-        percent_label.config(text=f'30%')
+                                prefilter_dist=(max_ball_protein if mds == 0 else None), ignore_res=ignore_res,
+                                progress_cb=_band(2, 14))
+    _prog(15)
+    load_points_yasara(target, point_cloud, keep_exclusion=keep_surf_points, progress_cb=_band(15, 48))
+    _prog(50)
+    points_to_cluster = generate_tunnel_points(target, point_protein_distance=max_ball_protein, ignore_res=ignore_res, mds=mds)
+    _prog(55)
 
     if mds > 0:
         # MD
@@ -861,6 +878,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
             load_points_yasara(target, point_cloud, keep_exclusion = keep_surf_points)
             points_to_cluster = generate_tunnel_points(target, point_protein_distance = max_ball_protein, ignore_res=ignore_res, mds=mds)
             SaveSce(f'{target}_MD{i}.sce')
+            _prog(55 + 23 * (i + 1) / mds)   # ramp the MD band across iterations
             if i == mds -1:
                 RenumberObj(f'org_{target_name}'[:12], target)
                 NameObj(f'org_{target_name}'[:12], target_name)
@@ -868,25 +886,18 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
                 AddObj('All')
                 SwitchObj(f'MD?_{target_name}', 'OFF')
 
-    if progress_var != None and percent_label != None:
-        progress_var.set(80)
-        percent_label.config(text=f'80%')
+    # Clustering ramps its band as per-cluster objects are built. The band starts where
+    # the preceding phase left off: 78 after MD, else 55 (no MD gap to jump over now).
+    _cluster_base = 78 if mds > 0 else 55
+    cluster_tunnel_points_dbscan(target, points_to_cluster, min_vol, ball_spacing, connect_cut,
+                                 start_time=start_time, progress_cb=_band(_cluster_base, 88))
 
-    cluster_tunnel_points_dbscan(target, points_to_cluster, min_vol, ball_spacing, connect_cut, start_time=start_time)
-
-    if progress_var != None and percent_label != None:  
-        progress_var.set(90)
-        percent_label.config(text=f'90%')
-
+    _prog(90)
     DelObj("Du")
     SwitchObj(f'{target}Cl???????? {target}excluded {target}Close2Surf {target}Close2Prot', 'OFF')
     SwitchObj(ListObj(f'{target}Cl???????')[:5], "ON")
     HideMessage()
     SwitchObj(f'{str(target)}TPolygon?', 'off')
-
-    if progress_var != None and percent_label != None:  
-        progress_var.set(95)
-        percent_label.config(text=f'95%')
 
     # --- Refine the rough surface representation ---
     # Build a finer point cloud (0.6 A spacing) near the protein surface, then
@@ -896,7 +907,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
     tpoints_hull_vertices, hull_simplices = get_hull(tpoints)
     tpoints_cube_points = get_cube_points(tpoints_hull_vertices, REFINED_SURF_SPACING)
     tpoints_shape_points = get_shape_points(tpoints_cube_points, tpoints_hull_vertices)
-    tpoints_outside_points = load_cif_points(tpoints_shape_points, PWD() + os.path.sep + f'{target}tpoints_shape_points.cif', correct=True, center=False)[0]
+    tpoints_outside_points = load_cif_points(tpoints_shape_points, PWD() + os.path.sep + f'{target}tpoints_shape_points.cif', correct=True, center=False, progress_cb=_band(90, 98))[0]
     MoveObj(tpoints_outside_points,z=OBJECT_Z_OFFSET)
     # Keep only points within SURFACE_REFINE_DISTANCE of the protein's accessible surface
     DelAtom(f'obj {tpoints_outside_points} with distance > {SURFACE_REFINE_DISTANCE} from accessible surface of obj {target}')
@@ -914,10 +925,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
     DelAtom(f'obj {tar} atom !backbone')
     JoinObj(tar, f'{target}roughsurf')
 
-    if progress_var != None and percent_label != None:  
-        progress_var.set(99)
-        percent_label.config(text=f'99%')
-
+    _prog(99)
 
     ShowSurfRes(f'obj {target}roughsurf element Du', 'accessible',outcol='blue', outalpha=50,incol='red',inalpha=50)
     HideObj(f'{target}roughsurf')
