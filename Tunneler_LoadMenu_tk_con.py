@@ -82,6 +82,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 import re
 import os
+import tempfile
 from configparser import ConfigParser
 from Tunneler_function_con import *
 import threading
@@ -115,6 +116,87 @@ def _attach_elapsed_timer(win):
         except tk.TclError:
             return
     win.after(0, _tick)
+
+
+_ICOSPHERE_CACHE = {}
+
+def _icosphere(level):
+    """Return (vertices Nx3, faces Mx3 0-indexed) of a unit icosphere at the given
+    subdivision level, matching YASARA's ShowSphere tessellation levels (0=20 faces,
+    1=80, 2=320, 3=1280). Cached per level."""
+    level = int(level)
+    if level in _ICOSPHERE_CACHE:
+        return _ICOSPHERE_CACHE[level]
+    phi = (1 + 5 ** 0.5) / 2
+    V = [(-1, phi, 0), (1, phi, 0), (-1, -phi, 0), (1, -phi, 0), (0, -1, phi), (0, 1, phi),
+         (0, -1, -phi), (0, 1, -phi), (phi, 0, -1), (phi, 0, 1), (-phi, 0, -1), (-phi, 0, 1)]
+    V = [tuple(np.array(v) / np.linalg.norm(v)) for v in V]
+    F = [(0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11), (1, 5, 9), (5, 11, 4),
+         (11, 10, 2), (10, 7, 6), (7, 1, 8), (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8),
+         (3, 8, 9), (4, 9, 5), (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1)]
+    for _ in range(level):
+        mid = {}; nV = list(V); nF = []
+        def _mid(a, b):
+            k = (a, b) if a < b else (b, a)
+            if k in mid:
+                return mid[k]
+            p = np.array(V[a]) + np.array(V[b]); p = p / np.linalg.norm(p)
+            nV.append(tuple(p)); mid[k] = len(nV) - 1
+            return mid[k]
+        for a, b, c in F:
+            ab, bc, ca = _mid(a, b), _mid(b, c), _mid(c, a)
+            nF += [(a, ab, ca), (b, bc, ab), (c, ca, bc), (ab, bc, ca)]
+        V, F = nV, nF
+    res = (np.array(V, float), np.array(F, int))
+    _ICOSPHERE_CACHE[level] = res
+    return res
+
+def _write_obj_rows(f, arr, rowfmt, chunk=1000000):
+    """Write rows of `arr` to binary file `f` as text via C-level (rowfmt*k) % tuple,
+    chunked to bound peak memory. ~2x faster than a per-row generator join for the
+    millions of lines a large sphere mesh needs."""
+    n = len(arr); i = 0
+    while i < n:
+        blk = arr[i:i + chunk]
+        f.write(((rowfmt * len(blk)) % tuple(blk.ravel().tolist())).encode())
+        i += chunk
+
+def _load_sphere_mesh(centers, radius, color, alpha, level):
+    """Draw many equal-radius spheres of a SINGLE colour as one polygon-mesh object,
+    built in numpy and imported via LoadWOb in a single call. This replaces ~2 YASARA
+    calls per sphere (ShowSphere+PosObj) with one file load -> ~15x faster at large
+    tunnels. Returns the new object number.
+
+    LoadWOb quirks handled here (validated against ShowSphere, see project notes):
+      * it applies T=(x,y,-z) to file coords and offsets by the object position, so we
+        pre-flip z on the centres and template and PosObj(0,0,0) -> world == centres;
+      * the z-reflection reverses triangle winding, so we reverse the face order, else
+        YASARA shades the spheres' dark interiors (they render near-black);
+      * open='No' culls back faces -> matches ShowSphere's transparency density so the
+        alpha slider maps 1:1 (no remap needed).
+    """
+    Vt, Ft = _icosphere(level)
+    centers = np.asarray(centers, float).reshape(-1, 3)
+    C = centers.copy(); C[:, 2] *= -1
+    Vr = Vt.copy(); Vr[:, 2] *= -1          # z-reflect template to cancel LoadWOb's T
+    Fr = Ft[:, ::-1]                        # reverse winding (z-reflection flipped it)
+    n = len(C); vpr = len(Vr)
+    verts = (C[:, None, :] + Vr[None, :, :] * radius).reshape(-1, 3)
+    norms = np.tile(Vr, (n, 1))
+    faces = (Fr[None, :, :] + 1 + (np.arange(n) * vpr)[:, None, None]).reshape(-1, 3)
+    face6 = np.repeat(faces, 2, axis=1)     # 'f a//a b//b c//c' needs each index twice
+    fd, path = tempfile.mkstemp(suffix='.obj', prefix='ts'); os.close(fd)
+    try:
+        with open(path, 'wb') as f:
+            _write_obj_rows(f, verts, 'v %.3f %.3f %.3f\n')
+            _write_obj_rows(f, norms, 'vn %.3f %.3f %.3f\n')
+            _write_obj_rows(f, face6, 'f %d//%d %d//%d %d//%d\n')
+        obj = LoadWOb(path, color=color, alpha=alpha, open='No')[0]
+        PosObj(obj, 0, 0, 0)
+        return obj
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
 
 
 def tunneler_dialog():
@@ -221,6 +303,7 @@ def tunneler_dialog():
         SwitchObj(ListObj(f'{tar}Cl???????')[:5], "ON")
         transf_and_fix_ss(tar)
         DelObj('???_sphere ???_shape')
+        _sph_cache_clear()   # new clusters -> any stashed sphere sets are stale
         # Recluster recreated the clusters (freshly coloured by tunnel) and invalidated
         # any distance colouring. Drop the whole distance cache (selection + colour +
         # signature) and reflect the reality in the GUI: select the 'Tunnel' colour mode
@@ -391,79 +474,149 @@ def tunneler_dialog():
         Wait(1)
         Console("hidden")
 
+    def build_sphere_objects(progress=False, force_show=False):
+        """(Re)build all tunnel sphere-mesh objects from the clusters' CURRENT colours.
+
+        Mesh spheres bake their colour in at load time (LoadWOb) and can't be recoloured
+        in place, so a colour-mode change rebuilds them. The point positions are unchanged
+        but the per-colour grouping is not, so it is a full (fast, ~seconds) mesh rebuild.
+        Assumes the console is already OFF (callers manage it).
+
+        force_show=True makes every rebuilt tunnel visible regardless of its cluster's
+        current on/off state -- used when rebuilding for a colour switch, where the
+        clusters are hidden (spheres are the active view) so their state would wrongly
+        hide the new spheres."""
+        DelObj('???_Sphere')
+        tunnel_objs = ListObj(f'{target()}Cl???????')
+        total_spheres = CountAtom(f'Obj {target()}Cl???????')
+        # Pick the smoothest sphere tessellation whose total triangle count stays
+        # within a safe budget. Faces per ShowSphere-equivalent level: 0->20, 1->80,
+        # 2->320, 3->1280. YASARA OOMs loading a mesh well beyond ~20M triangles, so
+        # small tunnels get round L3/L2 spheres while only very large ones step down.
+        _FACES = {0: 20, 1: 80, 2: 320, 3: 1280}
+        sphere_level = next((lv for lv in (3, 2, 1, 0)
+                             if total_spheres * _FACES[lv] <= 20000000), 0)
+        _roundness = {0: 'low', 1: 'reduced', 2: 'high', 3: 'maximum'}[sphere_level]
+        ShowMessage(f"Creating {total_spheres:,} spheres at {_roundness} roundness "
+                    f"(level {sphere_level}/3, auto-set for the point count).")
+        Wait(1)
+        radius = rad_chk.get() / 100 * 2.5
+        alpha = alpha_chk.get()
+        done = 0
+        for targetobj in tunnel_objs:
+            ShowMessage(f"Creating {CountAtom(f'Obj {targetobj}'):,} spheres of tunnel "
+                        f"{NameObj(targetobj)[0]} at {_roundness} roundness (level {sphere_level}/3)")
+            Wait(1)
+            on_off = 'On' if force_show else SwitchObj(targetobj)[0]
+            SwitchObj(targetobj, 'Off')
+            DelObj(f'sphere x{targetobj:03d}_sphere')
+            p = np.array(PosAtom(f'obj {targetobj}', coordsys='global')).reshape(-1, 3)
+            col = np.array(ColorAtom(f'obj {targetobj}'))
+
+            # One polygon-mesh object per distinct colour (LoadWOb takes a single
+            # colour), each renamed 'sphere'; grouping keeps the whole build to a
+            # handful of file loads instead of ~2 YASARA calls per point.
+            order = np.argsort(col, kind='stable')
+            p_s, col_s = p[order], col[order]
+            uniq, starts = np.unique(col_s, return_index=True)
+            bounds = list(starts) + [len(col_s)]
+            for i, cv in enumerate(uniq):
+                o = _load_sphere_mesh(p_s[bounds[i]:bounds[i + 1]], radius, int(cv), alpha, sphere_level)
+                NameObj(o, 'sphere')
+                if progress:
+                    frac = (done + bounds[i + 1]) / total_spheres * 100
+                    progress_var.set(frac)
+                    percent_label.config(text=f'{frac:.0f}%')
+                    # build runs on the main thread (see show_progress_spheres); repaint
+                    # the progress bar without processing input events (no reentrancy).
+                    try: progress_window.update_idletasks()
+                    except Exception: pass
+            done = done + len(p)
+
+            # Join this tunnel's per-colour meshes into one object (center='No' avoids
+            # the O(N^2) re-centering the default Center=Yes would do on each join).
+            jobj = ListObj('sphere')[0]
+            JoinObj('sphere', jobj, center='No')
+            SwitchObj(jobj, on_off)
+            NameObj(jobj, f'{targetobj:03d}_sphere')
+
     def Spheres(new=False, progress=False):
-        """Switch tunnel display to sphere mode (one YASARA sphere per tunnel point)."""
-        Console("OFF")   # load-bearing: with the console ON every ShowSphere/PosObj prints,
-                         # making the build ~220x slower (measured 0.75s -> 167s for 5000 spheres)
+        """Switch tunnel display to sphere mode (one mesh sphere per tunnel point)."""
+        Console("OFF")   # load-bearing: with the console ON every LoadWOb/PosObj prints,
+                         # making the build dramatically slower (see build_sphere_objects)
         if ListObj('???_Sphere') != [] and not new:
             on_tunnels = [x for x,y in zip(ListObj(f'{target()}Cl???????'), SwitchObj(f'{target()}Cl???????')) if y == 'On']
             if len(on_tunnels) == 0:
                 on_tunnels = [int(x[2:3]) for x,y in zip(NameObj('???_shape'), SwitchObj('???_shape')) if y == 'On']
             SwitchObj(" ".join([str(f'{x:03d}') + '_Sphere' for x in on_tunnels]), "on")
         else:
-            DelObj('???_Sphere')
-            tunnel_objs = ListObj(f'{target()}Cl???????')
-            total_spheres = CountAtom(f'Obj {target()}Cl???????')
-            if total_spheres < 3000:
-                ShowMessage(f"Creating {total_spheres} Spheres.")
-                sphere_level = 3
-            elif total_spheres < 10000:
-                ShowMessage(f"Creating {total_spheres} Spheres of rad {r}. This process can take several minutes.")
-                sphere_level = 2
-            elif total_spheres < 40000:
-                ShowMessage(f"Creating {total_spheres:,} Spheres. This process can take very long. Click Continue or type StopPlugin in the Console")
-                sphere_level = 1
-                Wait('Continuebutton')
-            else:
-                ShowMessage(f"Creating {total_spheres:,} Spheres. This process can take extremely long. Click Continue or type StopPlugin in the Console")
-                sphere_level = 0
-                Wait('Continuebutton')
-            Wait(1)
-            done = 0
-            for targetobj in tunnel_objs:
-                ShowMessage(f"Creating {CountAtom(f'Obj {targetobj}'):,} Spheres of tunnel {NameObj(targetobj)[0]}")
-                Wait(1)
-                on_off = SwitchObj(targetobj)[0]
-                SwitchObj(targetobj, 'Off')
-                DelObj(f'sphere x{targetobj:03d}_sphere')
-                atomlist = ListAtom(f'obj {targetobj}')
-                p = PosAtom(f'obj {targetobj}',coordsys='global')
-                col = ColorAtom(f'obj {targetobj}')
-
-                modulo_value = 0
-                for o in range(len(atomlist)):
-                    obj = ShowSphere(radius=rad_chk.get() /100 * 2.5, color=col[o], alpha=alpha_chk.get(), level=sphere_level)
-                    PosObj(obj, p[(o+1)*3-3], p[(o+1)*3-2], p[(o+1)*3-1])
-                    if o == modulo_value:
-                        modulo_value += 1000
-                        jobj = ListObj('sphere')[0]
-                        # center='No' avoids O(N^2) re-centering of the growing mesh on each join
-                        # (default Center=Yes shifts every vertex of the whole object per join).
-                        JoinObj('sphere', jobj, center='No')
-                        ShowMessage(f'Created {o:,} / {len(atomlist):,} spheres of tunnel {NameObj(targetobj)[0]}.')
-                        Wait(1)
-                        if progress:
-                            progress_var.set((o + done) / total_spheres *100)
-                            percent_label.config(text=f'{(o + done) / total_spheres *100:.0f}%')
-                            # build runs on the main thread (see show_progress_spheres); repaint
-                            # the progress bar without processing input events (no reentrancy).
-                            try: progress_window.update_idletasks()
-                            except Exception: pass
-                done = done + len(atomlist)
-                if progress:
-                    progress_var.set(done / total_spheres *100)
-                    percent_label.config(text=f'{done / total_spheres *100:.0f}%')
-
-                jobj = ListObj('sphere')[0]
-                JoinObj('sphere', jobj, center='No')
-                SwitchObj(jobj, on_off)
-                NameObj('sphere', f'{targetobj:03d}_sphere')
+            _sph_cache_clear()                       # a fresh build invalidates cached sets
+            build_sphere_objects(progress)
+            _sph_state['mode'] = radio_col_var.get()   # remember what colouring this set has
+            _sph_state['sig'][_sph_state['mode']] = _sph_sig(_sph_state['mode'])
 
         SwitchObj(f'{target()}Cl???????', 'off')
         SwitchObj('???_shape', 'off')
         HideMessage()
         Wait(1)
         Console("hidden")
+
+    # --- Sphere colour-mode cache -------------------------------------------------
+    # Mesh spheres bake their colour in (LoadWOb), so switching Colour by Tunnel<->
+    # Distance needs a different mesh set. Rather than rebuild every time, keep the
+    # inactive mode's set hidden and renamed (sphT###/sphD### -- deliberately NOT
+    # matching the plugin's '???_sphere' selectors) and just swap, rebuilding only when
+    # the geometry/colour settings for that mode actually changed.
+    _sph_state = {'mode': None, 'sig': {}}   # 'mode' = colouring of the visible set
+    _SPH_SUF = {'tunnel': 'T', 'distance': 'D'}
+
+    def _sph_sig(mode):
+        """Signature of a sphere set: rebuild is needed whenever this changes."""
+        base = f'r{rad_chk.get()}|a{alpha_chk.get()}'
+        if mode == 'tunnel':
+            return f'tunnel|{base}|s{step_entry.get()}'
+        tar = target()
+        return f'distance|{base}|{PairObj(tar, "dist_sel")}|{PairObj(tar, "dist_sig")}'
+
+    def _sph_cache_clear():
+        DelObj('sphT??? sphD???')
+        _sph_state['mode'] = None
+        _sph_state['sig'] = {}
+
+    def recolor_spheres_for_mode(mode):
+        """Called when the colour mode changes to `mode`. If spheres are the active view,
+        show a cached set for that mode when its settings are unchanged, else rebuild.
+        If spheres aren't shown, drop stale sets so the next Spheres build is fresh."""
+        if radio_var.get() != 'spheres':
+            DelObj('???_sphere sphT??? sphD???')
+            _sph_state['mode'] = None
+            _sph_state['sig'] = {}
+            return
+        Console("OFF")
+        cur = _sph_state['mode']
+        tsig = _sph_sig(mode)
+        if cur == mode:
+            if _sph_state['sig'].get(mode) == tsig:
+                HideMessage(); Wait(1); Console("hidden"); return   # already correct
+            DelObj('???_sphere')
+            build_sphere_objects(force_show=True)
+        else:
+            if cur is not None and ListObj('???_sphere') != []:     # stash outgoing set
+                for o in ListObj('???_sphere'):
+                    num = NameObj(o)[0].split('_')[0]
+                    NameObj(o, f'sph{_SPH_SUF[cur]}{num}'); SwitchObj(o, 'Off')
+            if _sph_state['sig'].get(mode) == tsig and ListObj(f'sph{_SPH_SUF[mode]}???') != []:
+                for o in ListObj(f'sph{_SPH_SUF[mode]}???'):        # CACHE HIT: reuse
+                    num = NameObj(o)[0][3 + len(_SPH_SUF[mode]):]
+                    NameObj(o, f'{num}_sphere'); SwitchObj(o, 'On')
+            else:
+                DelObj(f'sph{_SPH_SUF[mode]}???')                    # stale -> rebuild
+                build_sphere_objects(force_show=True)
+        _sph_state['mode'] = mode
+        _sph_state['sig'][mode] = tsig
+        SwitchObj(f'{target()}Cl???????', 'off')
+        SwitchObj('???_shape', 'off')
+        HideMessage(); Wait(1); Console("hidden")
 
     def group_and_color(atomlist, collist, mind_console=True):
         """Batch-color atoms by grouping them by color first (much faster than per-atom calls)."""
@@ -534,6 +687,7 @@ def tunneler_dialog():
                 else:
                     ShowMessage('Problem occured: ???_shape and Cl?????? objects do not have the same number of atoms. Try deleting shapes and recreate.')
                     Wait('Continuebutton')
+            recolor_spheres_for_mode('distance')   # mesh spheres bake in colour -> swap/rebuild set
             Console("hidden")
             return
 
@@ -642,8 +796,9 @@ def tunneler_dialog():
 
         PairObj(tar, 'dist_col', dist_sel[0])
         PairObj(tar, 'dist_sig', cur_sig)
-        HideMessage()
         DelObj('CenterHlp')
+        recolor_spheres_for_mode('distance')   # mesh spheres bake in colour -> swap/rebuild set
+        HideMessage()
         Wait(1)
         Console("hidden")
 
@@ -1468,6 +1623,7 @@ def tunneler_dialog():
             for objnum in objs:
                 ColorObj(objnum, (objnum +1) * step)
                 ColorObj(str(f'{objnum:03d}') + '_shape', (objnum +1) * step)
+        recolor_spheres_for_mode('tunnel')   # mesh spheres bake in colour -> swap/rebuild set
         HideMessage()
         Wait(1)
         if mind_console:
