@@ -1498,26 +1498,77 @@ def tunneler_dialog():
     radiobutton6.configure(text='Spheres', variable=radio_var, value="spheres", command=lambda: show_progress_spheres(new=False))
     radiobutton6.place(anchor="nw", x=3, y=105)
 
+    def _make_debounced(fn, delay=300):
+        """Return a trigger that runs fn() once, `delay` ms after the LAST call. Rapid
+        repeats (mousewheel scrubbing, typing) coalesce into a single deferred call, so an
+        expensive apply (a sphere/MergeSph rebuild) fires once per burst, not per notch."""
+        st = {'id': None}
+        def trigger(*_):
+            if st['id'] is not None:
+                try:
+                    root.after_cancel(st['id'])
+                except Exception:
+                    pass
+            st['id'] = root.after(delay, fn)
+        return trigger
+
+    def _numeric_spinbox(parent, var, lo, hi, apply_fn, x, y, width=55, wheel=10, delay=300):
+        """Compact integer Spinbox bound to IntVar `var`, clamped to [lo, hi]. The arrow
+        buttons and typing give +/-1 fine control; the MOUSEWHEEL jumps by `wheel` (a
+        bigger step so scrubbing a 1-100 range isn't tedious) -- the two are independent.
+        Value changes DEBOUNCE-apply via apply_fn so a scroll/type burst triggers one
+        rebuild. `var` is kept a valid int at all times so the many existing `var.get()`
+        readers stay safe."""
+        def _valid(proposed):
+            # allow empty (mid-edit) and any in-range digit string; below-lo is fine while
+            # typing (e.g. '4' on the way to '40'), _commit clamps it up afterwards
+            return proposed == '' or (proposed.isdigit() and int(proposed) <= hi)
+        vcmd = (root.register(_valid), '%P')
+        sb = ttk.Spinbox(parent, from_=lo, to=hi, increment=1, width=4,
+                         validate='key', validatecommand=vcmd, textvariable=var)
+        sb.place(anchor="nw", x=x, y=y, width=width)
+        trig = _make_debounced(apply_fn, delay)
+        def _clamp():
+            try:
+                v = int(var.get())
+            except (tk.TclError, ValueError):
+                v = lo
+            var.set(min(hi, max(lo, v)))
+        def _commit(*_):
+            _clamp(); trig()
+        def _wheel(e):
+            try:
+                v = int(var.get())
+            except (tk.TclError, ValueError):
+                v = lo
+            up = getattr(e, 'delta', 0) > 0 or getattr(e, 'num', 0) == 4
+            var.set(min(hi, max(lo, v + (wheel if up else -wheel))))
+            trig()
+            return 'break'   # don't let the wheel also scroll a parent container
+        sb.configure(command=_commit)          # arrow buttons
+        sb.bind('<Return>', _commit)            # typed value -> apply
+        sb.bind('<FocusOut>', _commit)
+        sb.bind('<MouseWheel>', _wheel)         # macOS / Windows
+        sb.bind('<Button-4>', _wheel)           # Linux up
+        sb.bind('<Button-5>', _wheel)           # Linux down
+        return sb
+
     def _on_sphere_alpha_release(*_):
-        """Apply a sphere-alpha slider change on release. Mesh spheres can't be re-alpha'd
-        in place, so this rebuilds -- but alpha is excluded from the geometry signature,
-        so the cached .obj files are reused and only the (fast) LoadWOb re-runs. No-op
-        unless spheres are the active view. Size still uses the explicit 'new' button, as
-        it needs a full geometry rewrite."""
+        """Apply a sphere-alpha change (debounced). Mesh spheres can't be re-alpha'd in
+        place, so this rebuilds -- but alpha is excluded from the geometry signature, so
+        the cached .obj files are reused and only the (fast) LoadWOb re-runs. No-op unless
+        spheres are the active view."""
         if radio_var.get() != 'spheres' or ListObj('???_Sphere') == []:
             return
         Spheres(new=True)
 
     alpha_chk = tk.IntVar()
-    scale2 = ttk.Scale(tab2_appear, from_=1, to=100)
-    scale2.configure(orient="horizontal", state="normal", variable=alpha_chk)
-    scale2.place(anchor="nw", x=125, y=85, height=30, width=136)
+    alpha_spin = _numeric_spinbox(tab2_appear, alpha_chk, 1, 100,
+                                  _on_sphere_alpha_release, x=125, y=87)
     alpha_chk.set(19)
-    # apply on release: reuses cached geometry, re-LoadWOb with the new alpha
-    scale2.bind('<ButtonRelease-1>', _on_sphere_alpha_release)
 
     def _on_sphere_size_release(*_):
-        """Apply a size slider change on release. The size slider is shared: it's the ball
+        """Apply a size change (debounced). The size control is shared: it's the ball
         radius for both Spheres and the MergeSph shape (VdW/accessible ignore it). Size
         changes every vertex, so the geometry is fully rebuilt (spheres: rewrite .obj via
         the progress window; MergeSph: recompute marching cubes). No-op for reps that don't
@@ -1529,12 +1580,9 @@ def tunneler_dialog():
             Shapes(new=True)   # MergeSph radius changed -> marching-cubes recompute
 
     rad_chk = tk.IntVar()
-    scale3 = ttk.Scale(tab2_appear, from_= 4, to=100)
-    scale3.configure(orient="horizontal", state="normal", variable=rad_chk)
-    scale3.place(anchor="nw", x=125, y=106, height=30, width=136)
+    rad_spin = _numeric_spinbox(tab2_appear, rad_chk, 4, 100,
+                                _on_sphere_size_release, x=125, y=108)
     rad_chk.set(18)
-    # apply on release: full geometry rebuild (size changes every vertex)
-    scale3.bind('<ButtonRelease-1>', _on_sphere_size_release)
 
     label1 = ttk.Label(tab2_appear)
     label1.configure(text = 'alpha')
@@ -1747,12 +1795,9 @@ def tunneler_dialog():
     shape_surf_option.trace_add("write", Shapes)
 
     shape_alpha_chk = tk.IntVar()
-    shape_alpha_scale = ttk.Scale(tab2_appear, from_=1, to=100)
-    shape_alpha_scale.configure(orient="horizontal", state="normal", variable=shape_alpha_chk)
-    shape_alpha_scale.place(anchor="nw", x=200, y=125, height=30, width=100)
+    shape_alpha_spin = _numeric_spinbox(tab2_appear, shape_alpha_chk, 1, 100,
+                                        _on_shape_alpha_release, x=200, y=127)
     shape_alpha_chk.set(80)
-    # apply on release: dynamic surfaces re-alpha in place, MergeSph reloads from cache
-    shape_alpha_scale.bind('<ButtonRelease-1>', _on_shape_alpha_release)
 
 
     # target -> (n_cluster_atoms, min_dist, max_dist). The per-atom distance itself
@@ -2051,9 +2096,42 @@ def tunneler_dialog():
     label14.configure(text='step')
     label14.place(anchor="nw", x=20, y=180)
 
-    step_entry = ttk.Entry(tab2_appear)
-    step_entry.place(anchor="nw", x=20, y=198, width=40)
+    # Spinbox (compact: number + arrows + mousewheel) rather than a bare entry, and it
+    # applies the colouring live instead of only when the Tunnel radio is re-clicked.
+    # step is a hue increment 0-360; changing it re-runs Colorbytunnel (which reuses the
+    # sphere .obj cache since colour step doesn't change the geometry).
+    step_entry = ttk.Spinbox(tab2_appear, from_=0, to=360, increment=5, width=4)
+    step_entry.place(anchor="nw", x=20, y=198, width=52)   # fits before the x=79 separator
+    step_entry.delete(0, tk.END)
     step_entry.insert(0, '25')
+
+    def _on_step_change(*_):
+        """Live-apply the step value -- only while Tunnel colouring is the active mode
+        and tunnels exist (else it takes effect when the user switches to Tunnel)."""
+        if target() is None or radio_col_var.get() != 'tunnel':
+            return
+        Colorbytunnel()
+
+    def _step_nudge(delta):
+        try:
+            v = int(step_entry.get())
+        except (ValueError, TypeError):
+            v = 25
+        v = min(360, max(0, v + delta))
+        step_entry.delete(0, tk.END)
+        step_entry.insert(0, v)
+        _on_step_change()
+
+    def _step_wheel(e):
+        # macOS/Windows use e.delta (sign), Linux uses Button-4/5 (e.num)
+        _step_nudge(5 if (getattr(e, 'delta', 0) > 0 or getattr(e, 'num', 0) == 4) else -5)
+
+    step_entry.configure(command=_on_step_change)   # fires on the arrow buttons
+    step_entry.bind('<Return>', _on_step_change)     # typed value -> apply on Enter
+    step_entry.bind('<FocusOut>', _on_step_change)   # ...or when focus leaves
+    step_entry.bind('<MouseWheel>', _step_wheel)
+    step_entry.bind('<Button-4>', _step_wheel)
+    step_entry.bind('<Button-5>', _step_wheel)
 
     def on_colbydist():
         SelectDistAtom(win=True)
