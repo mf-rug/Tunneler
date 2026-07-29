@@ -480,10 +480,12 @@ def _xsec_mesh_load(shape2d, u, v, nrm, c, color, alpha, simplify_tol):
     return _load_polygon_mesh(verts, faces, norms, _ycolor(color), alpha)
 
 
-def _build_xsec_object(shapes2d, u, v, plane_origin, objname, anchor_obj):
+def _build_xsec_object(shapes2d, u, v, plane_origin, objname, anchor_obj, fill_alpha):
     """Build the filled + outlined cross-section overlay object `objname` from a list
     of shapely polygons in plane-2D coords (one per cluster/lobe). Returns the object
-    number, or None if nothing was drawn.
+    number, or None if nothing was drawn. `fill_alpha` sets the translucency of the fill
+    (driven by the same alpha control as the rectangular plane); the rim stays opaque so
+    the outline is always legible.
 
     `anchor_obj` is the tunnel object the overlay belongs to. LoadWOb meshes are baked
     in the current global (screen) frame and do NOT rotate with the scene on their own
@@ -501,7 +503,7 @@ def _build_xsec_object(shapes2d, u, v, plane_origin, objname, anchor_obj):
     for sh in shapes2d:
         if sh is None or sh.is_empty:
             continue
-        fill = _xsec_mesh_load(sh, u, v, nrm, c, _XSEC_FILL_COL, _XSEC_FILL_ALPHA, 0.25)
+        fill = _xsec_mesh_load(sh, u, v, nrm, c, _XSEC_FILL_COL, fill_alpha, 0.25)
         if fill is not None:
             objs.append(fill)
         rim = _xsec_mesh_load(sh.boundary.buffer(_XSEC_EDGE_W / 2), u, v, nrm, c,
@@ -633,8 +635,7 @@ def tunneler_dialog():
         reset_ax.place_forget()
         adjust_ax.place_forget()
         make_path.place_forget()
-        cut_axis_alpha_scale.place_forget()
-        cut_axis_alpha_value_label.place_forget()
+        cut_axis_alpha_spin.place_forget()
         cut_axis_alpha_label.place_forget()
         cut_points_button.place_forget()
         plane_radio.place_forget()
@@ -653,8 +654,7 @@ def tunneler_dialog():
         adjust_ax.place(anchor="nw", x=50, y=243)
         reset_ax.place(anchor="nw", x=103, y=243)
         cut_axis_alpha_label.place(anchor="nw", x=0, y=267)
-        cut_axis_alpha_value_label.place(anchor="nw", x=128, y=267)
-        cut_axis_alpha_scale.place(anchor="nw", x=40, y=268, width=85)
+        cut_axis_alpha_spin.place(anchor="nw", x=40, y=266)
         cut_points_button.place(anchor="nw", x=0, y=289)
         plane_radio.place(anchor="nw", x=0, y=311)
         section_radio.place(anchor="nw", x=62, y=311)
@@ -3586,7 +3586,7 @@ def tunneler_dialog():
                 if xsec_build:
                     _build_xsec_object(xsec_shapes, u, v, plane_origin,
                                        f'{ListObj(tnl_name)[0]:03d}_xsec',
-                                       ListObj(tnl_name)[0])
+                                       ListObj(tnl_name)[0], cut_axis_alpha.get())
 
                 # Set the axis limits after determining the bounds for all clusters
                 all_data_width = all_data_x_max - all_data_x_min
@@ -3750,16 +3750,13 @@ def tunneler_dialog():
                                     value='section', command=on_xsec_mode)
 
 
-    def new_cut_axis_alpha(var, label, n=0):
-        on_diameter()
-        label.config(text=f"{var.get():.{n}f}")
-
+    # Alpha for the cutting-plane display: drives BOTH the rectangular plane and the
+    # cross-section fill (whichever the plane/section radio selects). Compact debounced
+    # Spinbox, like the sphere/shape alpha controls.
     cut_axis_alpha_label = tk.Label(tab3_inspect, text=f"alpha")
     cut_axis_alpha = tk.IntVar(value=90)
-    cut_axis_alpha_value_label = tk.Label(tab3_inspect, text=f"{cut_axis_alpha.get():.0f}")
-    cut_axis_alpha_scale = ttk.Scale(tab3_inspect, from_=1, to=100, orient="horizontal", variable=cut_axis_alpha,
-                            command=lambda value, var=cut_axis_alpha, label=cut_axis_alpha_value_label: new_cut_axis_alpha(var, label))
-    new_cut_axis_alpha(cut_axis_alpha, cut_axis_alpha_value_label)
+    cut_axis_alpha_spin = _numeric_spinbox(tab3_inspect, cut_axis_alpha, 1, 100,
+                                           on_diameter, x=40, y=266)
 
     def on_cut_detail():
         Console('off')
