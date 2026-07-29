@@ -3316,8 +3316,16 @@ def tunneler_dialog():
                     max1 = ListAtom(f'obj {tnl_name}A with maximum distance from obj {tnl_name}')[0]
                     max2 = ListAtom(f'obj {tnl_name} with minimum distance from {max1}')[0]
 
-                    # an imperfect solution for the fact that try - except doesn't work for yasara commands.
-                    if not all([True if x == 'True' else False for x in PairObj(f'{tar}Cl???????A', 'fix')]):
+                    # Ensure each 'A' companion shares its cluster object's coordinate
+                    # system before the cross-object Distance() below (else YASARA
+                    # raises error 467). A wildcard PairObj only returns entries for
+                    # objects that HAVE the key, so an unset object is simply absent
+                    # from the list — an empty/short list means "not all fixed yet".
+                    # Compare the fixed-count against the number of 'A' objects rather
+                    # than using all(), which is True on the empty (nothing-fixed) list.
+                    n_a_objs = len(ListObj(f'{tar}Cl???????A'))
+                    n_fixed = sum(1 for x in PairObj(f'{tar}Cl???????A', 'fix') if x == 'True')
+                    if n_fixed < n_a_objs:
                         ShowMessage('Aligning coordinate systems, please wait.')
                         Wait(1)
                         transf_and_fix_ss(tar)
