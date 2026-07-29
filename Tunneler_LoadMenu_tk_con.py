@@ -3889,6 +3889,10 @@ def tunneler_dialog():
     cut_axis_alpha = tk.IntVar(value=90)
     cut_axis_alpha_spin = _numeric_spinbox(tab3_inspect, cut_axis_alpha, 1, 100,
                                            on_diameter, x=40, y=266)
+    # _numeric_spinbox self-places on creation; the rest of the cross-section
+    # widgets start hidden and appear only via place_crosssection(), so forget it
+    # now to match -- otherwise it leaks through in the default 'All' state.
+    cut_axis_alpha_spin.place_forget()
 
     def on_cut_detail():
         Console('off')
