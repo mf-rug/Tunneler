@@ -637,7 +637,8 @@ def tunneler_dialog():
         cut_axis_alpha_value_label.place_forget()
         cut_axis_alpha_label.place_forget()
         cut_points_button.place_forget()
-        section_button.place_forget()
+        plane_radio.place_forget()
+        section_radio.place_forget()
         rough_path_button.place_forget()
         axis_button.place_forget()
         expose_path_button.place_forget()
@@ -655,7 +656,8 @@ def tunneler_dialog():
         cut_axis_alpha_value_label.place(anchor="nw", x=128, y=267)
         cut_axis_alpha_scale.place(anchor="nw", x=40, y=268, width=85)
         cut_points_button.place(anchor="nw", x=0, y=289)
-        section_button.place(anchor="nw", x=0, y=311)
+        plane_radio.place(anchor="nw", x=0, y=311)
+        section_radio.place(anchor="nw", x=62, y=311)
         make_path.place(anchor="nw", x=208, y=0)
         rough_path_button.place(anchor="nw", x=250, y=-2)
         expose_path_button.place(anchor="nw", x=250, y=14)
@@ -3547,7 +3549,7 @@ def tunneler_dialog():
                 total_area = 0
                 # Collect per-cluster shapes for the optional 3D cross-section overlay
                 # (built only for the live preview, not the detailed separate window).
-                xsec_build = on_canvas and section_chk.get()
+                xsec_build = on_canvas and xsec_mode.get() == 'section'
                 xsec_shapes = []
 
                 if not only_area:
@@ -3682,7 +3684,11 @@ def tunneler_dialog():
                     JoinObj(n, slice_obj)
             NameObj(slice_obj, f'{ListObj(tnl_name)[0]:03d}_slice')
             HideObj(slice_obj)
-            ShowPolygonAtoms('black', cut_axis_alpha.get(), 4, *ListAtom(f'obj {slice_obj}'))
+            # slice_obj is always built (draw_diameter_plot needs it to define the plane),
+            # but the visible black rectangle is only drawn in 'plane' mode -- in 'section'
+            # mode the filled cross-section overlay stands in for it.
+            if xsec_mode.get() == 'plane':
+                ShowPolygonAtoms('black', cut_axis_alpha.get(), 4, *ListAtom(f'obj {slice_obj}'))
 
             draw_diameter_plot(tnl_name, slice_obj, fig, ax)
 
@@ -3728,18 +3734,20 @@ def tunneler_dialog():
     cut_points_button = ttk.Checkbutton(tab3_inspect)
     cut_points_button.configure(text='only cut pts', variable=cut_points_chk, command=on_cut_points)
 
-    def on_section(*args):
-        """Toggle the 3D cross-section overlay (filled + outlined mesh on the plane)."""
+    # The cutting plane can be shown EITHER as the rectangular plane OR as the filled
+    # cross-section overlay -- not both (they represent the same slice). Radio choice.
+    def on_xsec_mode(*args):
+        """Switch between the rectangular plane and the cross-section overlay."""
         Console('off')
-        if not section_chk.get():
-            DelObj('???_xsec')
-        else:
-            on_diameter()   # rebuild the slice + overlay at the current position
+        DelObj('???_xsec')          # drop the overlay; on_diameter rebuilds per the mode
+        on_diameter()               # rebuild slice: shows plane or section as selected
         Console('hidden')
 
-    section_chk = tk.BooleanVar(value=False)
-    section_button = ttk.Checkbutton(tab3_inspect)
-    section_button.configure(text='section', variable=section_chk, command=on_section)
+    xsec_mode = tk.StringVar(value='plane')
+    plane_radio = ttk.Radiobutton(tab3_inspect, text='plane', variable=xsec_mode,
+                                  value='plane', command=on_xsec_mode)
+    section_radio = ttk.Radiobutton(tab3_inspect, text='section', variable=xsec_mode,
+                                    value='section', command=on_xsec_mode)
 
 
     def new_cut_axis_alpha(var, label, n=0):
