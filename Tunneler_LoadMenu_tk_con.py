@@ -3339,6 +3339,10 @@ def tunneler_dialog():
 
                     dist = round(mind + (tnl_aa_surf_dist.get() / 100.0) * (maxd - mind), 2)
 
+                # The surf-dup carries only the surface (its atoms are hidden). If the
+                # object itself is switched off, ShowSurfAtom draws a surface nobody can
+                # see — so make sure it is switched on whenever the surface is enabled.
+                SwitchObj(f'{tar}tnlAAsurf', 'on')
                 AddEnvRes(f'obj {tar}tnlAAsurf res protein')
                 HideSurfObj(f'{tar}tnlAAsurf')
                 surf_atms = " ".join(str(x) for x in ListAtom(f'obj {tar}tnlAAsurf res protein with distance < 0.1 from obj {tnl_name}A'))
