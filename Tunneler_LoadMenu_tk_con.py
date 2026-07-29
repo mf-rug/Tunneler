@@ -1081,18 +1081,29 @@ def tunneler_dialog():
     # as the 'cutp' segment last move, so SegAtom can be reset incrementally (O(k))
     # rather than re-stamping all N points each move. Cleared on new prediction,
     # recluster, and tunnel re-selection (see _xsec_cache_clear call-sites).
-    _xsec_cache = {'tnl': None, 'pos': None, 'atoms': None, 'cutp': None}
+    #
+    # 'frame' guards against scene ROTATION/MOVE: the positions are GLOBAL (screen)
+    # coords, which change when the user rotates the scene. If we kept stale positions,
+    # the next slider move would test them against the freshly-rotated cutting plane and
+    # select a garbage 'near' set (points fanning off the plane). We re-fetch whenever the
+    # tunnel object's PosOriObj signature changes -- a cheap O(1) check per move, O(N)
+    # refetch only on an actual frame change.
+    _xsec_cache = {'tnl': None, 'frame': None, 'pos': None, 'atoms': None, 'cutp': None}
 
     def _xsec_cache_clear():
-        _xsec_cache.update(tnl=None, pos=None, atoms=None, cutp=None)
+        _xsec_cache.update(tnl=None, frame=None, pos=None, atoms=None, cutp=None)
 
     def _xsec_get(tnl_name):
-        """(positions Nx3, atom-numbers) for a tunnel, cached across slider moves."""
-        if _xsec_cache['tnl'] != tnl_name or _xsec_cache['pos'] is None:
+        """(positions Nx3, atom-numbers) for a tunnel, cached across slider moves but
+        refetched when the tunnel's coordinate frame (rotation/position) changes."""
+        frame = _obj_frame_sig([ListObj(tnl_name)[0]])
+        if (_xsec_cache['tnl'] != tnl_name or _xsec_cache['frame'] != frame
+                or _xsec_cache['pos'] is None):
             _xsec_cache['tnl'] = tnl_name
+            _xsec_cache['frame'] = frame
             _xsec_cache['pos'] = np.array(PosAtom(f'Obj {tnl_name}', coordsys='global')).reshape(-1, 3)
             _xsec_cache['atoms'] = np.array(ListAtom(f'Obj {tnl_name}'))
-            _xsec_cache['cutp'] = None   # nothing marked yet for this tunnel
+            _xsec_cache['cutp'] = None   # nothing marked yet for this frame
         return _xsec_cache['pos'], _xsec_cache['atoms']
     # When set, a sphere rebuild inside recolor_spheres_for_mode drives the progress popup
     # created by _recolor_with_progress (used for the slow distance recolour in sphere mode).
