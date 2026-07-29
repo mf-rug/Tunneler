@@ -224,6 +224,79 @@ os.makedirs(_SPH_OBJ_DIR, exist_ok=True)
 atexit.register(lambda: shutil.rmtree(_SPH_OBJ_DIR, ignore_errors=True))
 
 
+# ============================================================
+#  "Follow YASARA" window behaviour (macOS)
+#
+#  Instead of pinning the dialog permanently on top (which also floats it
+#  over unrelated apps like a browser), we keep it -topmost only while the
+#  frontmost application is "ours" (YASARA itself, or this dialog's own Tk
+#  process) and drop it to a normal level when any other app is in front.
+#  Net effect: the dialog rides forward whenever YASARA is foregrounded and
+#  sinks behind whatever else you switch to.
+#
+#  macOS ships `lsappinfo`, which reports the frontmost app's pid + name
+#  with no extra dependency and no Automation-permission prompt. If it's
+#  unavailable (non-macOS, or the query fails), callers fall back to plain
+#  always-on-top. Toggling -topmost only restacks the window level; it does
+#  NOT activate our app, so it never steals keyboard focus from YASARA.
+# ============================================================
+def _macos_frontmost_app():
+    """Return (pid, name) of the frontmost macOS app, or (None, None) on failure."""
+    if sys.platform != 'darwin':
+        return (None, None)
+    try:
+        import subprocess
+        asn = subprocess.run(['lsappinfo', 'front'], capture_output=True,
+                             text=True, timeout=1.5).stdout.strip()
+        if not asn:
+            return (None, None)
+        out = subprocess.run(['lsappinfo', 'info', '-only', 'pid', '-only', 'name', asn],
+                            capture_output=True, text=True, timeout=1.5).stdout
+        pid_m = re.search(r'"pid"\s*=\s*(\d+)', out)
+        name_m = re.search(r'"LSDisplayName"\s*=\s*"([^"]*)"', out)
+        pid = int(pid_m.group(1)) if pid_m else None
+        name = name_m.group(1) if name_m else ''
+        return (pid, name)
+    except Exception:
+        return (None, None)
+
+
+def _macos_set_accessory(on):
+    """Hide (on=True) / show (on=False) this process in the macOS Dock + Cmd-Tab
+    switcher by setting the NSApplication activation policy (Accessory=1, Regular=0).
+
+    An 'accessory' app still shows windows and can take focus/keyboard input, it
+    just has no Dock icon and no app-switcher entry -> the dialog feels attached
+    to YASARA rather than a standalone app. Driven through the Obj-C runtime with
+    ctypes so no pyobjc dependency is needed. Returns True on success, else False
+    (non-macOS or any failure) so callers can silently keep the default policy.
+    """
+    if sys.platform != 'darwin':
+        return False
+    try:
+        import ctypes
+        objc = ctypes.CDLL('/usr/lib/libobjc.dylib')
+        ctypes.CDLL('/System/Library/Frameworks/AppKit.framework/AppKit')  # ensure NSApplication is registered
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        NSApplication = objc.objc_getClass(b'NSApplication')
+        # app = [NSApplication sharedApplication]  (returns Tk's existing NSApp)
+        objc.objc_msgSend.restype = ctypes.c_void_p
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        app = objc.objc_msgSend(NSApplication, objc.sel_registerName(b'sharedApplication'))
+        if not app:
+            return False
+        # [app setActivationPolicy: policy]  -> BOOL
+        objc.objc_msgSend.restype = ctypes.c_bool
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+        ok = objc.objc_msgSend(app, objc.sel_registerName(b'setActivationPolicy:'), 1 if on else 0)
+        return bool(ok)
+    except Exception:
+        return False
+
+
 _ICOSPHERE_CACHE = {}
 
 def _icosphere(level):
@@ -2943,19 +3016,66 @@ def tunneler_dialog():
         x=30,
         y=245)
 
-    # Function to toggle the window always on top
+    # --- "Follow YASARA" window behaviour --------------------------------
+    # When checked (default) the dialog rides forward with YASARA but sinks
+    # behind other apps: we keep it -topmost only while an "ours" app (YASARA
+    # or this dialog's own Tk process) is frontmost. Where the frontmost-app
+    # query is unavailable (non-macOS or lsappinfo missing) we fall back to
+    # plain always-on-top so the box never disappears behind YASARA.
+    _follow_pid, _ = _macos_frontmost_app()          # probe once
+    _follow_available = _follow_pid is not None
+    _follow_own_pid = os.getpid()
+    _follow_state = {'topmost': True, 'after_id': None}
+
+    def _follow_is_ours(pid, name):
+        return pid == _follow_own_pid or 'yasara' in (name or '').lower()
+
+    def _set_topmost(on):
+        if _follow_state['topmost'] != on:
+            root.attributes('-topmost', on)
+            _follow_state['topmost'] = on
+
+    def _follow_tick():
+        if not continue_loop:                        # dialog is closing -> stop the loop
+            return
+        try:
+            if always_on_top_var.get():
+                if not _follow_available:
+                    _set_topmost(True)               # fallback: plain always-on-top
+                else:
+                    pid, name = _macos_frontmost_app()
+                    if pid is not None:              # ignore transient query failures
+                        _set_topmost(_follow_is_ours(pid, name))
+        except tk.TclError:
+            return                                   # root went away mid-tick
+        except Exception:
+            pass                                     # never let one bad tick kill the loop
+        _follow_state['after_id'] = root.after(450, _follow_tick)
+
     def toggle_always_on_top():
         Console("OFF")
         if always_on_top_var.get():
-            root.attributes("-topmost", True)
+            # Attached mode: pop to front (poll then manages the level) and drop the
+            # standalone Dock/Cmd-Tab presence so the dialog rides with YASARA.
+            _set_topmost(True)
+            if _follow_available:
+                _macos_set_accessory(True)
         else:
-            root.attributes("-topmost", False)
+            # Independent mode: give it back its own switcher entry so it can be
+            # reached with Cmd-Tab when it isn't floating on top.
+            _set_topmost(False)
+            if _follow_available:
+                _macos_set_accessory(False)
 
-    # Variable for the always on top checkbox
+    # Variable for the follow/always-on-top checkbox
     always_on_top_var = tk.BooleanVar(value=True)
     checkbutton21 = ttk.Checkbutton(root)
-    checkbutton21.configure(text='Keep dialog on top', variable=always_on_top_var, command=toggle_always_on_top)
+    _follow_label = 'Follow YASARA' if _follow_available else 'Keep dialog on top'
+    checkbutton21.configure(text=_follow_label, variable=always_on_top_var, command=toggle_always_on_top)
     checkbutton21.place(anchor="nw", x=5, y=405)
+    if _follow_available and always_on_top_var.get():
+        _macos_set_accessory(True)                   # attached by default
+    _follow_tick()                                   # start the poll loop
 
     button4 = ttk.Button(root)
     button4.configure(text='Exit', command=on_cancel)
