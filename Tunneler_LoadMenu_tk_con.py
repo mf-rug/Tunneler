@@ -503,9 +503,15 @@ def _build_xsec_object(shapes2d, u, v, plane_origin, objname):
             objs.append(rim)
     if not objs:
         return None
-    base = objs[0]
-    for o in objs[1:]:
-        JoinObj(o, base)
+    if len(objs) == 1:
+        NameObj(objs[0], objname)
+        return objs[0]
+    # Join all sub-meshes in ONE call with Center=No, exactly like _union_shape_mesh.
+    # Pairwise JoinObj with the default Center=Yes recentres the destination and then
+    # rejects meshes whose centres differ ("Objects N and M differ significantly").
+    NameObj(' '.join(str(o) for o in objs), '_xsectmp')
+    base = ListObj('_xsectmp')[0]
+    JoinObj('_xsectmp', base, center='No')
     NameObj(base, objname)
     return base
 
