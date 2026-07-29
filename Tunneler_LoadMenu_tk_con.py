@@ -439,6 +439,77 @@ def _load_polygon_mesh(verts, faces, norms, color, alpha):
             os.remove(path)
 
 
+# ---- Cross-section overlay (Tab-3 'section' toggle) ---------------------------
+# Draw the tunnel's cross-section at the cutting plane as a thin filled + outlined
+# mesh lying on the plane, rebuilt live as the diameter slider moves. Colours,
+# alpha and rim width are cosmetic knobs.
+_XSEC_FILL_COL = '00e0ff'   # translucent cyan fill
+_XSEC_FILL_ALPHA = 45
+_XSEC_EDGE_COL = '00e0ff'   # bright cyan rim
+_XSEC_EDGE_ALPHA = 100
+_XSEC_EDGE_W = 0.35         # rim thickness (A)
+
+
+def _xsec_mesh_load(shape2d, u, v, nrm, c, color, alpha, simplify_tol):
+    """Triangulate a shapely (Multi)Polygon given in plane-2D (u,v) coords, lift each
+    vertex to 3D global via  p = x*u + y*v + c*nrm, and LoadWOb it as one flat
+    single-colour mesh (reusing _load_polygon_mesh). Returns the object number, or
+    None if nothing triangulable. Delaunay-of-vertices + inside-filter keeps the
+    triangulation inside concave outlines / holes (no Steiner points)."""
+    from shapely.ops import triangulate
+    geoms = list(shape2d.geoms) if shape2d.geom_type.startswith('Multi') else [shape2d]
+    verts = []
+    faces = []
+    for g in geoms:
+        if simplify_tol:
+            g = g.simplify(simplify_tol)
+        if g.is_empty or g.area <= 0:
+            continue
+        for t in triangulate(g):
+            if not g.contains(t.representative_point()):
+                continue
+            base = len(verts)
+            for x, y in list(t.exterior.coords)[:3]:
+                verts.append(x * u + y * v + c * nrm)
+            faces.append([base, base + 1, base + 2])
+    if not faces:
+        return None
+    verts = np.array(verts, dtype=float)
+    faces = np.array(faces, dtype=int)
+    norms = np.tile(nrm, (len(verts), 1))
+    return _load_polygon_mesh(verts, faces, norms, _ycolor(color), alpha)
+
+
+def _build_xsec_object(shapes2d, u, v, plane_origin, objname):
+    """Build the filled + outlined cross-section overlay object `objname` from a list
+    of shapely polygons in plane-2D coords (one per cluster/lobe). Returns the object
+    number, or None if nothing was drawn."""
+    nrm = np.cross(u, v)
+    n_len = np.linalg.norm(nrm)
+    if n_len == 0:
+        return None
+    nrm = nrm / n_len
+    c = float(np.dot(nrm, plane_origin))
+    objs = []
+    for sh in shapes2d:
+        if sh is None or sh.is_empty:
+            continue
+        fill = _xsec_mesh_load(sh, u, v, nrm, c, _XSEC_FILL_COL, _XSEC_FILL_ALPHA, 0.25)
+        if fill is not None:
+            objs.append(fill)
+        rim = _xsec_mesh_load(sh.boundary.buffer(_XSEC_EDGE_W / 2), u, v, nrm, c,
+                              _XSEC_EDGE_COL, _XSEC_EDGE_ALPHA, 0.05)
+        if rim is not None:
+            objs.append(rim)
+    if not objs:
+        return None
+    base = objs[0]
+    for o in objs[1:]:
+        JoinObj(o, base)
+    NameObj(base, objname)
+    return base
+
+
 def _skimage_missing():
     """True if scikit-image (needed for the MergeSph shape's marching cubes) is not
     importable -- lets the GUI show a helpful message instead of crashing."""
@@ -550,12 +621,12 @@ def tunneler_dialog():
         diam_down.place_forget()
         reset_ax.place_forget()
         adjust_ax.place_forget()
-        dia_plot.place_forget()
         make_path.place_forget()
         cut_axis_alpha_scale.place_forget()
         cut_axis_alpha_value_label.place_forget()
         cut_axis_alpha_label.place_forget()
         cut_points_button.place_forget()
+        section_button.place_forget()
         rough_path_button.place_forget()
         axis_button.place_forget()
         expose_path_button.place_forget()
@@ -573,7 +644,7 @@ def tunneler_dialog():
         cut_axis_alpha_value_label.place(anchor="nw", x=128, y=267)
         cut_axis_alpha_scale.place(anchor="nw", x=40, y=268, width=85)
         cut_points_button.place(anchor="nw", x=0, y=289)
-        dia_plot.place(anchor="nw", x=0, y=305)
+        section_button.place(anchor="nw", x=0, y=311)
         make_path.place(anchor="nw", x=208, y=0)
         rough_path_button.place(anchor="nw", x=250, y=-2)
         expose_path_button.place(anchor="nw", x=250, y=14)
@@ -1658,7 +1729,7 @@ def tunneler_dialog():
         # carry stale coordinates and, worse, a lingering NNN_axis would be taken for
         # the new tunnel's axis by on_diameter's existence check (feeding old In/Out
         # positions into the slice).
-        DelObj('???_axis ???_slice')
+        DelObj('???_axis ???_slice ???_xsec')
 
         Tunneler(target=re.findall(r"\d+(?=:)", target_option.get())[0], ignore_res=[listbox.get(i) for i in listbox.curselection()],
                  ignore_surface=ign_surf_scale_chk.get(), 
@@ -2902,7 +2973,7 @@ def tunneler_dialog():
             targ = target()
             tnl_name = get_tnl_name()
             ShowObj(tnl_name)
-            DelObj(f'???_slice ???_axis')
+            DelObj(f'???_slice ???_axis ???_xsec')
             if tnl_insp_option.get() != 'All':
                 tnl_objnum = re.findall(r"\d+(?=:)", tnl_insp_option.get())[0]
                 SwitchObj(f'{targ}Cl???????? ???_sphere ???_shape', 'OFF')
@@ -3360,7 +3431,7 @@ def tunneler_dialog():
         already in the scene at known global positions, so we read them directly and
         skip the whole fragile export/re-import.
         """
-        DelObj('???_axis ???_slice')
+        DelObj('???_axis ???_slice ???_xsec')
 
         # Tunnel points in global coordinates; the axis lives in the same frame.
         pts = np.array(PosAtom(f'obj {tnl_name}', coordsys='global')).reshape(-1, 3)
@@ -3452,6 +3523,10 @@ def tunneler_dialog():
 
                 cluster_shapes = {}
                 total_area = 0
+                # Collect per-cluster shapes for the optional 3D cross-section overlay
+                # (built only for the live preview, not the detailed separate window).
+                xsec_build = on_canvas and section_chk.get()
+                xsec_shapes = []
 
                 if not only_area:
                     StickAtom(tnl_points)
@@ -3475,11 +3550,18 @@ def tunneler_dialog():
                             continue
                     total_area += area
                     cluster_shapes[label] = (x, y, area)
+                    if xsec_build:
+                        xsec_shapes.append(merged_shape)
                     # Update the bounds for all clusters
                     all_data_x_min = min(all_data_x_min, min(x))
                     all_data_x_max = max(all_data_x_max, max(x))
                     all_data_y_min = min(all_data_y_min, min(y))
                     all_data_y_max = max(all_data_y_max, max(y))
+
+                # Build the 3D cross-section overlay (filled + outline) on the plane.
+                if xsec_build:
+                    _build_xsec_object(xsec_shapes, u, v, plane_origin,
+                                       f'{ListObj(tnl_name)[0]:03d}_xsec')
 
                 # Set the axis limits after determining the bounds for all clusters
                 all_data_width = all_data_x_max - all_data_x_min
@@ -3556,8 +3638,8 @@ def tunneler_dialog():
                 ext_center = ListAtom('obj ' + f'{ListObj(tnl_name)[0]:03d}_axis ' + 'atom In')[0]
                 ext_outer = ListAtom('obj ' + f'{ListObj(tnl_name)[0]:03d}_axis ' + 'atom Out')[0]
 
-            DelObj(f'{ListObj(tnl_name)[0]:03d}_slice')
-            
+            DelObj(f'{ListObj(tnl_name)[0]:03d}_slice {ListObj(tnl_name)[0]:03d}_xsec')
+
             # Create square cutting through tunnel along axis
             point1 = PosAtom(ext_outer, coordsys='global')
             point2 = PosAtom(ext_center, coordsys='global')
@@ -3619,9 +3701,22 @@ def tunneler_dialog():
                 on_diameter()
         Console("hidden")  
 
-    cut_points_chk = tk.BooleanVar(value=True)  
+    cut_points_chk = tk.BooleanVar(value=True)
     cut_points_button = ttk.Checkbutton(tab3_inspect)
     cut_points_button.configure(text='only cut pts', variable=cut_points_chk, command=on_cut_points)
+
+    def on_section(*args):
+        """Toggle the 3D cross-section overlay (filled + outlined mesh on the plane)."""
+        Console('off')
+        if not section_chk.get():
+            DelObj('???_xsec')
+        else:
+            on_diameter()   # rebuild the slice + overlay at the current position
+        Console('hidden')
+
+    section_chk = tk.BooleanVar(value=False)
+    section_button = ttk.Checkbutton(tab3_inspect)
+    section_button.configure(text='section', variable=section_chk, command=on_section)
 
 
     def new_cut_axis_alpha(var, label, n=0):
@@ -3647,9 +3742,11 @@ def tunneler_dialog():
         Wait(1)
         Console("hidden")
 
-    dia_plot = ttk.Button(tab3_inspect)
-    dia_plot.configure(text='Detailed Plot', command=on_cut_detail)
-    
+    # Clicking the preview plot itself opens the detailed (separate-window) plot,
+    # so no separate 'Detailed Plot' button is needed.
+    canvas_widget.configure(cursor='hand2')
+    canvas_widget.bind('<Button-1>', lambda e: on_cut_detail())
+
 
 
     
