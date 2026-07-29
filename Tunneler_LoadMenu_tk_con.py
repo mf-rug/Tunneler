@@ -480,10 +480,17 @@ def _xsec_mesh_load(shape2d, u, v, nrm, c, color, alpha, simplify_tol):
     return _load_polygon_mesh(verts, faces, norms, _ycolor(color), alpha)
 
 
-def _build_xsec_object(shapes2d, u, v, plane_origin, objname):
+def _build_xsec_object(shapes2d, u, v, plane_origin, objname, anchor_obj):
     """Build the filled + outlined cross-section overlay object `objname` from a list
     of shapely polygons in plane-2D coords (one per cluster/lobe). Returns the object
-    number, or None if nothing was drawn."""
+    number, or None if nothing was drawn.
+
+    `anchor_obj` is the tunnel object the overlay belongs to. LoadWOb meshes are baked
+    in the current global (screen) frame and do NOT rotate with the scene on their own
+    (verified: a raw mesh stays put while atoms rotate), so we TransferObj the finished
+    meshes onto `anchor_obj` with Local='Fix' -- this adopts the tunnel's coordinate
+    frame while keeping them on-screen where built, so they rotate with the tunnel
+    points (their cross-section) from then on."""
     nrm = np.cross(u, v)
     n_len = np.linalg.norm(nrm)
     if n_len == 0:
@@ -509,6 +516,8 @@ def _build_xsec_object(shapes2d, u, v, plane_origin, objname):
     # every sub-mesh the same name -- multiple objects can share a name and all the
     # cleanup is by name pattern (NNN_xsec / ???_xsec), so a single object is not needed.
     NameObj(' '.join(str(o) for o in objs), objname)
+    # Adopt the tunnel's coordinate frame so the overlay rotates with the scene.
+    TransferObj(objname, anchor_obj, 'Fix')
     return objs[0]
 
 
@@ -3563,7 +3572,8 @@ def tunneler_dialog():
                 # Build the 3D cross-section overlay (filled + outline) on the plane.
                 if xsec_build:
                     _build_xsec_object(xsec_shapes, u, v, plane_origin,
-                                       f'{ListObj(tnl_name)[0]:03d}_xsec')
+                                       f'{ListObj(tnl_name)[0]:03d}_xsec',
+                                       ListObj(tnl_name)[0])
 
                 # Set the axis limits after determining the bounds for all clusters
                 all_data_width = all_data_x_max - all_data_x_min
