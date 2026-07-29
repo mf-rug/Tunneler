@@ -297,6 +297,28 @@ def _macos_set_accessory(on):
         return False
 
 
+def _shell_mask(centers, spacing):
+    """Boolean mask over `centers` (N x 3): True = surface point, False = fully-interior.
+
+    The tunnel cloud is a cubic grid of spacing `spacing`, so a point is INTERIOR iff
+    all 26 grid neighbours are present (self + 26 = 27 points within the corner radius
+    spacing*sqrt(3)). Surface points are missing at least one neighbour. Rotation-
+    invariant (pairwise distances are preserved under the scene's global-frame rotation).
+
+    Used to render only the visible shell of an opaque tunnel -- the buried interior
+    contributes nothing to an opaque view. The source point cloud is never modified;
+    this only filters the arrays fed to the mesh builder / hide, so pathfinding,
+    cross-section and volume (which read all atoms) stay correct.
+    """
+    centers = np.asarray(centers, dtype=float)
+    if len(centers) == 0:
+        return np.ones(0, dtype=bool)
+    tree = cKDTree(centers)
+    r = spacing * np.sqrt(3) * 1.05          # reaches the 26-neighbourhood corner
+    counts = tree.query_ball_point(centers, r, return_length=True)
+    return np.asarray(counts) < 27           # 27 = self + 26 neighbours -> interior
+
+
 _ICOSPHERE_CACHE = {}
 
 def _icosphere(level):
@@ -920,32 +942,82 @@ def tunneler_dialog():
         if mind_console:
             Console("hidden")
 
-    def Removeinsidepoints():
-        """Hide or delete tunnel points that are buried inside the point cloud (not on the surface)."""
-        Console("OFF")
-        import re
-        tunnel_objs = ListObj(f'{target()}Cl???????')
-        delete_inside = del_hide_chk.get()
-        if delete_inside:
-            ShowMessage(f'Deleting inside points')
-        else:
-            ShowMessage(f'Hiding inside points')
-        Wait(22)
-        for targetobj in tunnel_objs:
-            RemoveEnvRes('all')
-            AddEnvRes(targetobj)
-            n_before = CountAtom(f'Obj {targetobj}')
-            if delete_inside:
-                DelAtom(f'obj {targetobj} with distance > 2.58 from accessible surface of obj {targetobj}')
+    def _hide_atoms_chunked(atomnums, size=4000):
+        """Hide a large list of atom numbers in bounded-size selection strings (one giant
+        selection can exceed YASARA's parser limits)."""
+        atomnums = [str(a) for a in atomnums]
+        for i in range(0, len(atomnums), size):
+            HideAtom('Atom ' + ' '.join(atomnums[i:i + size]))
+
+    def _perf_hide_interior(tar, on, bspacing):
+        """Points/balls rep: hide (on) / reveal (off) each tunnel's buried interior atoms.
+        Non-destructive -- the atoms stay in the object, so pathfinding / cross-section
+        still see them (they select all atoms regardless of visibility); they're just
+        not drawn."""
+        for o in ListObj(f'{tar}Cl???????'):
+            if on and bspacing:
+                p = np.array(PosAtom(f'obj {o}', coordsys='global')).reshape(-1, 3)
+                atoms = np.array(ListAtom(f'obj {o}'))
+                interior = atoms[~_shell_mask(p, bspacing)]
+                ShowAtom(f'obj {o}')
+                if len(interior):
+                    _hide_atoms_chunked(interior.tolist())
             else:
-                HideAtom(f'obj {targetobj} with distance > 2.58 from accessible surface of obj {targetobj}')
-            n = CountAtom(f'Obj {targetobj}')
-            NameObj(targetobj, re.sub('[0-9]+$', f'{n:06d}', NameObj(targetobj)[0]))
-            NameObj(targetobj + 1, 
-                    re.sub('[0-9]+$', f'{n:06d}', NameObj(targetobj)[0]) + 'A')
-            ShowMessage(f'Removed {n_before - n} inside points from object {targetobj}')
-            Wait(1)
-        
+                ShowAtom(f'obj {o}')
+
+    def improve_performance():
+        """Toggle non-destructive performance mode for the current scene.
+
+        ON  -> opaque tunnels render as their surface shell only: sphere meshes rebuild
+               shell-only (far fewer triangles) and points/balls hide interior atoms;
+               stashed inactive-mode meshes are freed. The '...Cl...' cloud is untouched,
+               so A* / cross-section / volume stay exact.
+        OFF -> full detail restored.
+        """
+        Console("OFF")
+        tar = target()
+        if tar is None:
+            Console("hidden"); return
+        on = not perf_var.get()
+        perf_var.set(on)
+        perf_button.configure(text='Restore detail' if on else 'Improve performance')
+        rep = radio_var.get()
+        bspacing = _ball_spacing_for(tar)
+
+        # measure how much is buried, for the report
+        total = culled = 0
+        if on and bspacing:
+            for o in ListObj(f'{tar}Cl???????'):
+                p = np.array(PosAtom(f'obj {o}', coordsys='global')).reshape(-1, 3)
+                total += len(p); culled += int((~_shell_mask(p, bspacing)).sum())
+
+        # reclaim memory: drop the stashed inactive colour-/shape-mode meshes (rebuilt on demand)
+        if on:
+            DelObj('sphT??? sphD??? shpV??? shpA??? shpM???')
+
+        # apply to the active rep (mesh rebuilds honour perf via _sphere_cull_on())
+        if rep in ('points', 'balls'):
+            _perf_hide_interior(tar, on, bspacing)
+        elif rep == 'spheres' and alpha_chk.get() >= 100:
+            show_progress_spheres(new=True)      # only opaque spheres change (cull on/off)
+
+        if on:
+            if rep == 'spheres' and alpha_chk.get() < 100:
+                ShowMessage('Performance mode ON, but spheres are transparent -- culling the '
+                            'interior would show through, so the mesh is unchanged. Make '
+                            'spheres opaque to lighten them.')
+            elif rep == 'shape':
+                ShowMessage('Performance mode ON: freed cached meshes. The Shape rep is '
+                            'already a compact surface, so its geometry is unchanged.')
+            elif bspacing and total:
+                ShowMessage(f'Performance mode ON: {culled:,} of {total:,} buried points '
+                            f'({100 * culled / total:.0f}%) dropped from rendering. '
+                            f'Pathfinding / cross-section data unchanged.')
+            else:
+                ShowMessage('Performance mode ON.')
+        else:
+            ShowMessage('Performance mode OFF -- full detail restored.')
+        Wait(30)
         HideMessage()
         Wait(1)
         Console("hidden")
@@ -1024,7 +1096,21 @@ def tunneler_dialog():
         prev_on = {nm[:3]: st for nm, st in
                    zip(NameObj('???_Sphere'), SwitchObj('???_Sphere'))}
         tunnel_objs = ListObj(f'{target()}Cl???????')
-        total_spheres = CountAtom(f'Obj {target()}Cl???????')
+        # Performance mode shell-cull: precompute each tunnel's surface positions +
+        # mask ONCE so the triangle budget, the progress bar and the per-tunnel loop
+        # all use the culled counts (and no PosAtom is fetched twice). The source
+        # cluster is never modified -- only these local arrays are filtered.
+        cull = _sphere_cull_on()
+        bspacing = _ball_spacing_for(target()) if cull else None
+        cull_pos, cull_mask = {}, {}
+        if cull and bspacing:
+            for targetobj in tunnel_objs:
+                pc = np.array(PosAtom(f'obj {targetobj}', coordsys='global')).reshape(-1, 3)
+                cull_pos[targetobj] = pc
+                cull_mask[targetobj] = _shell_mask(pc, bspacing)
+            total_spheres = int(sum(m.sum() for m in cull_mask.values()))
+        else:
+            total_spheres = CountAtom(f'Obj {target()}Cl???????')
         # Pick the smoothest sphere tessellation whose total triangle count stays
         # within a safe budget. Faces per ShowSphere-equivalent level: 0->20, 1->80,
         # 2->320, 3->1280. YASARA OOMs loading a mesh well beyond ~20M triangles, so
@@ -1057,7 +1143,15 @@ def tunneler_dialog():
         _WRITE_LAST[0] = 'reusing cached geometry' if reuse else 'idle'
         done = 0
         for targetobj in tunnel_objs:
-            ns = CountAtom(f'Obj {targetobj}')
+            col = _cluster_colors(targetobj)   # band-sourced (uniform type) in distance mode
+            # Performance mode: build only the visible surface shell of an opaque tunnel
+            # (buried interior spheres add triangles but are never seen). Reuse the
+            # precomputed positions + mask; the source cluster keeps all its atoms.
+            if cull and bspacing:
+                p, col = cull_pos[targetobj][cull_mask[targetobj]], col[cull_mask[targetobj]]
+            else:
+                p = np.array(PosAtom(f'obj {targetobj}', coordsys='global')).reshape(-1, 3)
+            ns = len(p)
             # intended write mode, shown live during the (possibly slow) build; the
             # 'built' message afterwards reports what actually happened.
             if reuse:
@@ -1069,13 +1163,12 @@ def tunneler_dialog():
             else:
                 wmode = f'multithread ({_WRITE_NPROC}w)'
             ShowMessage(f"Creating {ns:,} spheres of tunnel {NameObj(targetobj)[0]} at "
-                        f"{_roundness} roundness (level {sphere_level}/3, {_shade}, {wmode})")
+                        f"{_roundness} roundness (level {sphere_level}/3, {_shade}, {wmode}"
+                        f"{', shell only' if (cull and bspacing) else ''})")
             Wait(1)
             on_off = 'On' if force_show else prev_on.get(f'{targetobj:03d}', SwitchObj(targetobj)[0])
             SwitchObj(targetobj, 'Off')
             DelObj('sphere')   # clear stray temp meshes only; the OLD tunnel mesh stays until swapped
-            p = np.array(PosAtom(f'obj {targetobj}', coordsys='global')).reshape(-1, 3)
-            col = _cluster_colors(targetobj)   # band-sourced (uniform type) in distance mode
 
             # One polygon-mesh object per distinct colour (LoadWOb takes a single
             # colour), each renamed 'sphere'; grouping keeps the whole build to a
@@ -1209,7 +1302,7 @@ def tunneler_dialog():
         Radius and tessellation level DO change vertex data, so they're included, as does
         the object frame (globals go stale on rotate/move -- see _obj_frame_sig) and the
         'fast' flag (flat vs smooth changes what's written to the .obj)."""
-        base = f'r{rad_chk.get()}|L{level}|f{int(fast_chk.get())}'
+        base = f'r{rad_chk.get()}|L{level}|f{int(fast_chk.get())}|c{int(_sphere_cull_on())}'
         frame = _obj_frame_sig(ListObj(f'{target()}Cl???????'))
         if mode == 'tunnel':
             return f'tunnel|{base}|{frame}'
@@ -1564,6 +1657,27 @@ def tunneler_dialog():
 
     initializing = True
 
+    # --- Performance mode (non-destructive) ------------------------------------
+    # When on, opaque renders drop the buried interior of each tunnel: sphere
+    # meshes are built from the surface shell only (far fewer triangles) and the
+    # points/balls rep hides interior atoms. The source '...Cl...' cloud is never
+    # modified, so pathfinding / cross-section / volume (which read all atoms)
+    # stay exact. alpha_chk / radio_var are defined later but resolved lazily.
+    perf_var = tk.BooleanVar(value=False)
+
+    def _sphere_cull_on():
+        """Shell-cull sphere meshes only when perf mode is on AND they're opaque
+        (a transparent tube would reveal the hollow interior)."""
+        return perf_var.get() and alpha_chk.get() >= 100
+
+    def _ball_spacing_for(tar):
+        """Stored grid spacing of the tunnel cloud, or None if unavailable."""
+        bs = PairObj(tar, 'ball_spacing') or PairObj('All', 'ball_spacing')
+        try:
+            return float(bs[0])
+        except (IndexError, ValueError, TypeError):
+            return None
+
     # Create the Notebook widget
     notebook = ttk.Notebook(root)
     notebook.pack(expand=True, fill='both', padx=0)
@@ -1894,10 +2008,10 @@ def tunneler_dialog():
     # --------------------------------------------------------
     #  TAB 2 — APPEARANCE
     #  Sections: Show/Hide, display mode (Points/Balls/Spheres/Shape),
-    #  Color by (tunnel / distance), Actions (remove points, recluster),
+    #  Color by (tunnel / distance), Actions (improve performance, recluster),
     #  Surface points slider
     #  Callbacks: Tunnelonoff, Targetonoff, Balls, Points, Spheres,
-    #    Shapes, Colorbytunnel, Colorbytunneldist, Removeinsidepoints,
+    #    Shapes, Colorbytunnel, Colorbytunneldist, improve_performance,
     #    Recluster, ml_outside_points, SecStr, Surf, on_cut
     # --------------------------------------------------------
     tab2_appear = ttk.Frame(notebook)
@@ -2905,9 +3019,11 @@ def tunneler_dialog():
     separator9.configure(orient="horizontal")
     separator9.place(anchor="nw", height=2, width=255, x=45, y=274)
 
-    button1 = ttk.Button(tab2_appear)
-    button1.configure(style="Toolbutton", text='Remove invisible points', command=Removeinsidepoints)
-    button1.place(anchor="nw", x=0, y=284)
+    perf_button = ttk.Button(tab2_appear)
+    perf_button.configure(style="Toolbutton",
+                          text='Restore detail' if perf_var.get() else 'Improve performance',
+                          command=improve_performance)
+    perf_button.place(anchor="nw", x=0, y=284)
 
 
     def create_tooltip(widget, text, delay=775):
@@ -2950,12 +3066,11 @@ def tunneler_dialog():
         widget.bind('<Leave>', hide_tooltip)
 
 
-    create_tooltip(button1, "This action removes tunnel points on the inside of the point cloud.\nWhile they are normally invisible, tunnels will appear 'empty'\nif some tunnel points are removed, or upon close zoom.")
-
-    del_hide_chk = tk.BooleanVar()  # Variable to track the checkbox status
-    checkbutton9 = ttk.Checkbutton(tab2_appear)
-    checkbutton9.configure(text='permanently', variable=del_hide_chk)
-    checkbutton9.place(anchor="nw", x=157, y=286)
+    create_tooltip(perf_button, "Non-destructive speed-up for the current scene: opaque tunnels\n"
+                                "render as their surface shell only (the buried interior is never\n"
+                                "visible), so meshes have far fewer triangles and points/balls draw\n"
+                                "fewer atoms. The tunnel data is untouched -- pathfinding, cross-\n"
+                                "section and volume stay exact. Click again to restore full detail.")
 
     button2 = ttk.Button(tab2_appear)
     button2.configure(style="Toolbutton", text='Recluster', command=Recluster)
