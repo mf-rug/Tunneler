@@ -319,6 +319,51 @@ def _shell_mask(centers, spacing):
     return np.asarray(counts) < 27           # 27 = self + 26 neighbours -> interior
 
 
+def _plane_basis(axis):
+    """Return (axis, u, v): a right-handed orthonormal frame whose `axis` is the
+    given direction and whose (u, v) span the perpendicular plane. Used to project
+    tunnel points into a FIXED 2D frame for the area profile so lobe centroids are
+    directly comparable across successive slices (needed for track-matching)."""
+    axis = np.asarray(axis, dtype=float)
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    # Pick the cardinal axis least aligned with `axis` to avoid a degenerate cross.
+    e = np.eye(3)[int(np.argmin(np.abs(axis)))]
+    u = np.cross(axis, e); u /= (np.linalg.norm(u) or 1.0)
+    v = np.cross(axis, u)
+    return axis, u, v
+
+
+def _match_lobe_tracks(step_lobes, thresh):
+    """Greedy nearest-centroid matching of cross-section lobes across consecutive
+    slices, turning a per-slice list of lobes into continuous 'tracks' for a
+    stackplot. `step_lobes[i]` is a list of (area, cx, cy) for slice i. Returns a
+    list of tracks; each track is a length-`len(step_lobes)` list of areas, 0.0
+    where that lobe is absent. A track only extends from the immediately preceding
+    slice (centroid within `thresh`), so a branch spawns a new track (the band
+    splits) and a merge ends one (the band rejoins)."""
+    n = len(step_lobes)
+    tracks = []   # each: {'row': [0.0]*n, 'last': (cx, cy), 'end': last-slice-index}
+    for i, lobes in enumerate(step_lobes):
+        avail = [tr for tr in tracks if tr['end'] == i - 1]
+        used = set()
+        for area, cx, cy in lobes:
+            best, best_d = None, thresh
+            for tr in avail:
+                if id(tr) in used:
+                    continue
+                d = ((tr['last'][0] - cx) ** 2 + (tr['last'][1] - cy) ** 2) ** 0.5
+                if d < best_d:
+                    best_d, best = d, tr
+            if best is None:
+                best = {'row': [0.0] * n, 'last': (cx, cy), 'end': i}
+                tracks.append(best)
+            best['row'][i] = area
+            best['last'] = (cx, cy)
+            best['end'] = i
+            used.add(id(best))
+    return [tr['row'] for tr in tracks]
+
+
 _ICOSPHERE_CACHE = {}
 
 def _icosphere(level):
@@ -739,20 +784,28 @@ def tunneler_dialog():
         axis_button.place_forget()
         expose_path_button.place_forget()
         canvas_widget.place_forget()
+        profile_widget.place_forget()
 
     def place_crosssection():
         """Show all cross-section widgets on Tab 3 (when a specific tunnel is selected)."""
+        # --- area-profile strip tuning (eyeball these three; see note) --------------
+        #   PROFILE_Y / PROFILE_H : top and height (px) of the thin profile strip.
+        #   CTRL_SHIFT            : how far the sub-slider controls drop, to free the
+        #                           strip row and bottom-align with the preview canvas.
+        # The strip is x=19/width=115 to line up with the slider handle above it.
+        PROFILE_Y, PROFILE_H, CTRL_SHIFT = 240, 24, 24
         diamter_height_scale.place(anchor="nw", x=19, y=220, width=115)
         diam_up.place(anchor="nw", x=134, y=218)
         diam_down.place(anchor="nw", x=0, y=218)
-        axis_button.place(anchor="nw", x=0, y=245)
-        adjust_ax.place(anchor="nw", x=50, y=243)
-        reset_ax.place(anchor="nw", x=103, y=243)
-        cut_axis_alpha_label.place(anchor="nw", x=0, y=267)
-        cut_axis_alpha_spin.place(anchor="nw", x=40, y=266)
-        cut_points_button.place(anchor="nw", x=0, y=289)
-        plane_radio.place(anchor="nw", x=0, y=311)
-        section_radio.place(anchor="nw", x=62, y=311)
+        profile_widget.place(anchor="nw", x=19, y=PROFILE_Y, width=115, height=PROFILE_H)
+        axis_button.place(anchor="nw", x=0, y=245 + CTRL_SHIFT)
+        adjust_ax.place(anchor="nw", x=50, y=243 + CTRL_SHIFT)
+        reset_ax.place(anchor="nw", x=103, y=243 + CTRL_SHIFT)
+        cut_axis_alpha_label.place(anchor="nw", x=0, y=267 + CTRL_SHIFT)
+        cut_axis_alpha_spin.place(anchor="nw", x=40, y=266 + CTRL_SHIFT)
+        cut_points_button.place(anchor="nw", x=0, y=289 + CTRL_SHIFT)
+        plane_radio.place(anchor="nw", x=0, y=311 + CTRL_SHIFT)
+        section_radio.place(anchor="nw", x=62, y=311 + CTRL_SHIFT)
         make_path.place(anchor="nw", x=208, y=0)
         rough_path_button.place(anchor="nw", x=250, y=-2)
         expose_path_button.place(anchor="nw", x=250, y=14)
@@ -1257,9 +1310,14 @@ def tunneler_dialog():
     # tunnel object's PosOriObj signature changes -- a cheap O(1) check per move, O(N)
     # refetch only on an actual frame change.
     _xsec_cache = {'tnl': None, 'frame': None, 'pos': None, 'atoms': None, 'cutp': None}
+    # Area-vs-axis profile, keyed by (tunnel-name, point-count). Rotation/translation
+    # invariant (areas + axis projections don't change under the scene's global frame),
+    # so it survives rotations; the point-count key invalidates it on recluster/predict.
+    _profile_cache = {}
 
     def _xsec_cache_clear():
         _xsec_cache.update(tnl=None, frame=None, pos=None, atoms=None, cutp=None)
+        _profile_cache.clear()
 
     def _xsec_get(tnl_name):
         """(positions Nx3, atom-numbers) for a tunnel, cached across slider moves but
@@ -1631,8 +1689,23 @@ def tunneler_dialog():
     def on_cancel():
         Console("OFF")
         nonlocal continue_loop
+        continue_loop = False        # first, so an in-flight follow tick won't re-arm
+        # Cancel the follow poll's pending timer BEFORE teardown -- otherwise it fires
+        # after the interpreter is gone -> Tcl "invalid command name ..._follow_tick"
+        # bgerror that derails shutdown and can leave the process running.
+        try:
+            if _follow_state.get('after_id') is not None:
+                root.after_cancel(_follow_state['after_id'])
+                _follow_state['after_id'] = None
+        except Exception:
+            pass
+        # Close any detached plot windows -- they are their own Tk roots and would keep
+        # the process alive after the dialog is destroyed.
+        try:
+            plt.close('all')
+        except Exception:
+            pass
         Exit()
-        continue_loop = False
         root.destroy()
 
     # --------------------------------------------------------
@@ -3141,13 +3214,44 @@ def tunneler_dialog():
     _follow_available = _follow_pid is not None
     _follow_own_pid = os.getpid()
     _follow_state = {'topmost': True, 'after_id': None}
+    # Detached matplotlib plot windows are their own top-level Tk windows. We mirror the
+    # dialog's follow-topmost onto them so they ride with YASARA instead of getting
+    # buried -- wm_transient does NOT keep a window above another app on macOS, only the
+    # -topmost attribute does. They are closed on exit (plt.close in on_cancel).
+    _detached_wins = []
 
     def _follow_is_ours(pid, name):
         return pid == _follow_own_pid or 'yasara' in (name or '').lower()
 
+    def _apply_topmost(on):
+        """Set -topmost on the dialog AND every live detached plot window; prune dead ones."""
+        try:
+            root.attributes('-topmost', on)
+        except tk.TclError:
+            pass
+        alive = []
+        for w in _detached_wins:
+            try:
+                if w.winfo_exists():
+                    w.wm_attributes('-topmost', on)
+                    alive.append(w)
+            except Exception:
+                pass
+        _detached_wins[:] = alive
+
+    def _register_detached_fig(fig):
+        """Track a detached pyplot figure window so the follow poll keeps it at the
+        dialog's level (reachable, never buried). TkAgg only; silent no-op otherwise."""
+        try:
+            w = fig.canvas.manager.window
+            _detached_wins.append(w)
+            w.wm_attributes('-topmost', _follow_state['topmost'])
+        except Exception:
+            pass
+
     def _set_topmost(on):
         if _follow_state['topmost'] != on:
-            root.attributes('-topmost', on)
+            _apply_topmost(on)
             _follow_state['topmost'] = on
 
     def _follow_tick():
@@ -3165,7 +3269,8 @@ def tunneler_dialog():
             return                                   # root went away mid-tick
         except Exception:
             pass                                     # never let one bad tick kill the loop
-        _follow_state['after_id'] = root.after(450, _follow_tick)
+        if continue_loop:                            # don't re-arm during teardown
+            _follow_state['after_id'] = root.after(450, _follow_tick)
 
     def toggle_always_on_top():
         Console("OFF")
@@ -3244,8 +3349,10 @@ def tunneler_dialog():
                 NameObj('SimCell', 'CntrOfRot')
                 on_tnl_aas()
                 place_crosssection()
+                update_profile(tnl_name)   # draw the area-vs-axis strip for this tunnel
             else:
                 forget_crosssection()
+                clear_profile()
                 ZoomAtom('all', zoomsteps)
                 DelObj('CntrOfRot')
                 MarkAtom('none')
@@ -3684,6 +3791,15 @@ def tunneler_dialog():
     # Now calculate plot_width and plot_height based on figure size and dpi
     plot_width, plot_height = figsize_inches[0] * dpi, figsize_inches[1] * dpi
 
+    # Thin area-vs-axis "thickness profile" strip, drawn under the slider. Axes fill
+    # the whole figure (no margins/chrome) so it reads as a compact strip and its x
+    # lines up with the slider handle. Its canvas is created next to the main one and
+    # placed by place_crosssection().
+    profile_fig = Figure(dpi=dpi)
+    profile_ax = profile_fig.add_subplot(111)
+    profile_fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+    profile_ax.set_axis_off()
+
 
     def make_axis(tnl_name):
         """Create a PCA-based principal axis for a tunnel as a YASARA object.
@@ -3893,7 +4009,8 @@ def tunneler_dialog():
                 if on_canvas:
                     canvas.draw_idle()
                 else:
-                    plt.show()
+                    plt.show(block=False)
+                    _register_detached_fig(fig)   # follow the dialog's level, don't get lost
 
             else:
                 ShowMessage('Unexpected state: near_indices and projected points mismatch.')
@@ -3949,6 +4066,7 @@ def tunneler_dialog():
                 ShowPolygonAtoms('black', cut_axis_alpha.get(), 4, *ListAtom(f'obj {slice_obj}'))
 
             draw_diameter_plot(tnl_name, slice_obj, fig, ax)
+            _update_profile_marker()   # move the detailed-window slice line, if open
 
         else:
             ax.clear()
@@ -3959,8 +4077,158 @@ def tunneler_dialog():
         Console("hidden")
 
 
-    canvas = FigureCanvasTkAgg(fig, master=tab3_inspect)  
+    canvas = FigureCanvasTkAgg(fig, master=tab3_inspect)
     canvas_widget = canvas.get_tk_widget()
+
+    profile_canvas = FigureCanvasTkAgg(profile_fig, master=tab3_inspect)
+    profile_widget = profile_canvas.get_tk_widget()   # placed by place_crosssection()
+
+    def compute_area_profile(tnl_name):
+        """Sweep the cutting plane along the tunnel's PCA axis and return its
+        cross-sectional-area profile, split by lobe.
+
+        Pure numpy + shapely -- no per-step YASARA objects. The area metric is the
+        SAME as the live cross-section plot (buffered-circle union), so the profile's
+        y at any position matches what the slider shows there. Slices are taken every
+        `ball_spacing` (half-thickness slab, tiling without gaps), projected into a
+        FIXED plane frame, DBSCAN-clustered into lobes, and each lobe's area computed;
+        lobes are then matched across slices into continuous tracks.
+
+        Returns (xs, tracks, axis_len): xs = slider position (0..100, 0 = Out end,
+        100 = In end, matching diamter_height); tracks = list of per-lobe area arrays
+        for a stackplot; axis_len = In<->Out distance in A (to convert xs to Angstrom
+        for the detailed plot). Returns ([], [], 0.0) when a profile can't be built.
+        """
+        pos, _ = _xsec_get(tnl_name)
+        pts = np.asarray(pos, dtype=float)
+        bs = _ball_spacing_for(target())
+        if len(pts) < 4 or not bs:
+            return [], [], 0.0
+        # Use the SAME axis the cross-section slider uses: the In/Out marker atoms of the
+        # tunnel's _axis object (which the user can re-orient with Adjust), so the profile
+        # follows an adjusted axis instead of a fresh PCA. Fall back to the raw PCA axis
+        # (+ protein-centre In/Out rule) when that object isn't present yet.
+        axis_obj = f'{ListObj(tnl_name)[0]:03d}_axis'
+        in_pos = out_pos = None
+        if ListObj(axis_obj):
+            try:
+                in_pos = np.array(PosAtom(f'obj {axis_obj} atom In', coordsys='global'), dtype=float)
+                out_pos = np.array(PosAtom(f'obj {axis_obj} atom Out', coordsys='global'), dtype=float)
+            except Exception:
+                in_pos = out_pos = None
+        if in_pos is not None and out_pos is not None and np.linalg.norm(in_pos - out_pos) > 1e-6:
+            axis, u, v = _plane_basis(in_pos - out_pos)   # points Out -> In
+            t = pts @ axis
+            t_in, t_out = float(in_pos @ axis), float(out_pos @ axis)
+        else:
+            axis, u, v = _plane_basis(find_principal_axis(pts))
+            t = pts @ axis
+            i_lo, i_hi = int(t.argmin()), int(t.argmax())
+            # Orient x like the slider: 0 = Out (extreme farther from the protein centre),
+            # 100 = In (extreme closer to it) -- same In/Out rule as make_axis().
+            cen = np.array(PosAtom(f'obj {target()}', mean=True, coordsys='global'))
+            d_lo = np.linalg.norm(pts[i_lo] - cen)
+            d_hi = np.linalg.norm(pts[i_hi] - cen)
+            t_in, t_out = (float(t[i_lo]), float(t[i_hi])) if d_lo < d_hi else (float(t[i_hi]), float(t[i_lo]))
+        if t_in == t_out:
+            return [], [], 0.0
+        origin = pts.mean(axis=0)
+        pu = (pts - origin) @ u
+        pv = (pts - origin) @ v
+        # Sweep between the Out and In ends (the slider's range), stepping at EXACTLY
+        # ball_spacing from a real end coordinate so the half-thickness (bs/2) slabs tile
+        # with no gaps and no double-counting -- linspace spaced them slightly wider than
+        # a slab, dropping points between grid layers and breaking continuous tracks. The
+        # tiny epsilon keeps a point sitting exactly on a slab boundary from being missed.
+        lo, hi = (t_out, t_in) if t_out <= t_in else (t_in, t_out)
+        centers = np.arange(lo, hi + bs * 0.5, bs)
+        if len(centers) < 2:
+            centers = np.linspace(lo, hi, 2)
+        half = bs / 2.0 + 1e-6
+        xs, step_lobes = [], []
+        for tc in centers:
+            xs.append((tc - t_out) / (t_in - t_out) * 100.0)
+            m = np.abs(t - tc) < half
+            if not m.any():
+                step_lobes.append([])
+                continue
+            proj = np.column_stack([pu[m], pv[m]])
+            labels = cluster_points_with_dbscan(proj, 1.4, 1)
+            lobes = []
+            for lab in set(labels):
+                if lab == -1:
+                    continue
+                cl = proj[labels == lab]
+                area, _ = calculate_area_of_points(cl, bs * 2, radius=0.75)
+                lobes.append((area, float(cl[:, 0].mean()), float(cl[:, 1].mean())))
+            step_lobes.append(lobes)
+        # Sort steps by x ascending (stackplot needs monotonic x); linspace makes x
+        # monotonic already, so this just fixes orientation without breaking adjacency.
+        order = list(np.argsort(xs))
+        xs = [xs[i] for i in order]
+        step_lobes = [step_lobes[i] for i in order]
+        tracks = _match_lobe_tracks(step_lobes, thresh=max(bs * 3, 2.0))
+        axis_len = float(abs(t_out - t_in))
+        return xs, tracks, axis_len
+
+    def _profile_get(tnl_name):
+        """Cached (xs, tracks, axis_len) for a tunnel. Keyed by (name, point-count) so
+        a recluster/predict (which changes the count or the name) recomputes, while
+        re-selecting the same tunnel is instant."""
+        pos, _ = _xsec_get(tnl_name)
+        key = (str(tnl_name), len(pos))
+        if key not in _profile_cache:
+            _profile_cache[key] = compute_area_profile(tnl_name)
+        return _profile_cache[key]
+
+    def clear_profile():
+        """Blank the profile strip (e.g. when 'All' is selected)."""
+        try:
+            profile_ax.clear()
+            profile_ax.set_axis_off()
+            profile_canvas.draw_idle()
+        except Exception:
+            pass
+
+    def update_profile(tnl_name):
+        """Compute (cached) + draw the area profile for the selected tunnel. Never
+        raises -- a profile failure must not break tunnel selection."""
+        try:
+            xs, tracks, _ = _profile_get(tnl_name)
+            profile_ax.clear()
+            profile_ax.set_axis_off()
+            if xs and tracks:
+                profile_ax.stackplot(xs, *tracks)
+                profile_ax.set_xlim(0, 100)
+                profile_ax.set_ylim(bottom=0)
+            profile_canvas.draw_idle()
+        except Exception:
+            clear_profile()
+
+    # Live link to the open detailed-profile window: its figure/axes (for a full redraw
+    # after an axis change) and its slice marker (moved live by the slider). Valid only
+    # while that figure stays open AND the same tunnel stays selected.
+    _profile_detail = {'line': None, 'fig': None, 'ax': None,
+                       'fignum': None, 'tnl': None, 'axis_len': 0.0}
+
+    def _update_profile_marker():
+        """Move the red 'current slice' line in the open detailed-profile window to the
+        live slider position. Self-cleaning no-op if the window was closed or a
+        different tunnel is now selected. Never raises."""
+        try:
+            line = _profile_detail['line']
+            if line is None:
+                return
+            if not plt.fignum_exists(_profile_detail['fignum']):
+                _profile_detail.update(line=None, fig=None, ax=None, fignum=None, tnl=None)
+                return
+            if str(get_tnl_name()) != _profile_detail['tnl']:
+                return
+            pos_a = diamter_height.get() / 100.0 * _profile_detail['axis_len']
+            line.set_xdata([pos_a, pos_a])
+            line.figure.canvas.draw_idle()
+        except Exception:
+            pass
 
     diamter_height = tk.DoubleVar(value=0.5)
     diamter_height_scale = ttk.Scale(tab3_inspect, from_=0, to=100, orient="horizontal", variable=diamter_height, command=on_diameter)
@@ -4036,6 +4304,81 @@ def tunneler_dialog():
     # so no separate 'Detailed Plot' button is needed.
     canvas_widget.configure(cursor='hand2')
     canvas_widget.bind('<Button-1>', lambda e: on_cut_detail())
+
+    def _render_profile_detail(ax2, tnl_name):
+        """(Re)draw the detailed area-profile plot into ax2 from the current (cached)
+        profile data, with real Angstrom axes + labels. Returns (marker_line, axis_len),
+        or (None, 0.0) if there is no profile to draw."""
+        xs, tracks, axis_len = _profile_get(tnl_name)
+        ax2.clear()
+        if not xs or not tracks or axis_len <= 0:
+            return None, 0.0
+        # xs is 0..100 (0 = Out, 100 = In); convert to A along the axis (Out at 0).
+        xs_a = [x / 100.0 * axis_len for x in xs]
+        totals = [sum(rows) for rows in zip(*tracks)]   # total area per slice
+        ax2.stackplot(xs_a, *tracks, labels=[f'lobe {i + 1}' for i in range(len(tracks))])
+        # Mark the live slider position (diamter_height is 0..100 along the axis).
+        pos_a = diamter_height.get() / 100.0 * axis_len
+        marker = ax2.axvline(pos_a, color='red', linestyle='--', linewidth=1.0,
+                             label='current slice')
+        ax2.set_xlim(0, axis_len)
+        ax2.set_ylim(bottom=0)
+        ax2.set_xlabel('Position along axis (Å)   Out → In')
+        ax2.set_ylabel('Cross-section area (Å²)')
+        bottleneck = min(totals) if totals else 0.0
+        ax2.set_title(f'Tunnel {ListObj(tnl_name)[0]} — area profile (bottleneck {bottleneck:.1f} Å²)')
+        ax2.grid(True, linewidth=0.3, color='gray')
+        if len(tracks) > 1:
+            ax2.legend(loc='upper right', fontsize=8)
+        return marker, axis_len
+
+    def on_profile_detail():
+        """Open the tunnel area profile large, in its own window with real axes/labels.
+        The strip is deliberately bare; this is the readable version."""
+        Console('off')
+        try:
+            if tnl_insp_option.get() == 'All':
+                ShowMessage('Select a tunnel first'); Wait(25); HideMessage()
+                return
+            tnl_name = get_tnl_name()
+            fig2, ax2 = plt.subplots()
+            marker, axis_len = _render_profile_detail(ax2, tnl_name)
+            if marker is None:
+                plt.close(fig2)
+                ShowMessage('No area profile for this tunnel'); Wait(25); HideMessage()
+                return
+            # Remember the figure/axes/marker so on_diameter can move the marker live and
+            # an axis Adjust/Reset can redraw the whole plot while this window stays open.
+            _profile_detail.update(line=marker, fig=fig2, ax=ax2, fignum=fig2.number,
+                                   tnl=str(tnl_name), axis_len=axis_len)
+            plt.show(block=False)
+            _register_detached_fig(fig2)   # follow the dialog's level, don't get lost
+        except Exception:
+            pass
+        finally:
+            Wait(1)
+            Console('hidden')
+
+    def _refresh_profile_detail():
+        """Redraw the open detailed-profile window (if any) from current data -- e.g. after
+        an axis Adjust/Reset changed the profile. No-op if it is closed or now shows a
+        different tunnel. Never raises."""
+        try:
+            if _profile_detail['ax'] is None:
+                return
+            if not plt.fignum_exists(_profile_detail['fignum']):
+                _profile_detail.update(line=None, fig=None, ax=None, fignum=None, tnl=None)
+                return
+            if str(get_tnl_name()) != _profile_detail['tnl']:
+                return
+            marker, axis_len = _render_profile_detail(_profile_detail['ax'], get_tnl_name())
+            _profile_detail.update(line=marker, axis_len=axis_len)
+            _profile_detail['fig'].canvas.draw_idle()
+        except Exception:
+            pass
+
+    profile_widget.configure(cursor='hand2')
+    profile_widget.bind('<Button-1>', lambda e: on_profile_detail())
 
 
 
@@ -4171,7 +4514,13 @@ def tunneler_dialog():
         GrabAll()
         HideMessage()
         on_diameter()
-        Console("hidden")        
+        # The axis orientation changed -> the cached profile is stale; recompute + redraw
+        # the strip and the big detailed window (if it is open).
+        _profile_cache.clear()
+        if tnl_insp_option.get() != 'All':
+            update_profile(get_tnl_name())
+            _refresh_profile_detail()
+        Console("hidden")
 
     adjust_ax = ttk.Button(tab3_inspect)
     adjust_ax.configure(text='Adjust', style='Toolbutton', command=on_adjust)
@@ -4182,6 +4531,10 @@ def tunneler_dialog():
         if tnl_insp_option.get() != 'All':
             make_axis(get_tnl_name())
             on_diameter()
+            # Axis reset to PCA -> stale cached profile; recompute + redraw strip + window.
+            _profile_cache.clear()
+            update_profile(get_tnl_name())
+            _refresh_profile_detail()
         else:
             ShowMessage('Select a tunnel first.')
             Wait(20)
