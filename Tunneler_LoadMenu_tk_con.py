@@ -1263,16 +1263,24 @@ def tunneler_dialog():
             NameObj(jobj, 'caver_sphere')
         Console("hidden")
 
-    def _import_caver_from(folder, offer_align=True):
+    def _import_caver_from(folder, offer_align=True, frame_obj=None):
         """Import CAVER output under `folder` as a rainbow 'beads on a string' overlay:
         locate .../clusters_timeless/*.pdb (per-cluster pseudo-atom strings, B-factor =
-        tunnel radius) and the input structure (sibling .../inputs/*.pdb, else a non-origin
-        .pdb in the clusters' parent data/ dir). Each cluster becomes a molecule tA, tB...
-        joined into one 'caver' object coloured by hue, hidden, then every pseudo-atom drawn
-        as a sphere sized by its B-factor. When `offer_align` and other objects are loaded,
-        prompts to SHEBA-align onto one (moving the joined tunnels with it). Returns True on
-        success. Shared by manual Import and the Run-CAVER auto-import (which passes
-        offer_align=False -- fresh output is already in the loaded structure's frame)."""
+        tunnel radius). Each cluster becomes a molecule tA, tB... joined into one 'caver'
+        object coloured by hue, hidden, then every pseudo-atom drawn as a sphere sized by its
+        B-factor. Returns True on success.
+
+        Two modes:
+        - frame_obj is None (manual Import): load CAVER's own input copy (sibling
+          .../inputs/*.pdb, else a non-origin .pdb in the clusters' parent data/ dir) as the
+          base object, and if `offer_align` and other objects are present, prompt to
+          SHEBA-align onto one (moving the joined tunnels with it).
+        - frame_obj is an object number (Run-CAVER auto-import): NO input copy is loaded --
+          the tunnels are placed directly in that object's coordinate frame so they overlay
+          the original structure exactly. A SavePDB(transform='No') -> LoadPDB round-trip
+          preserves local coords, so loading each tunnel (center=False) and stamping the
+          joined object with the original's PosOriObj is an exact overlay; `offer_align` is
+          then irrelevant."""
         clusters_dir = None
         for dirpath, _dirs, _files in os.walk(folder):
             if os.path.basename(dirpath) == 'clusters_timeless':
@@ -1287,54 +1295,69 @@ def tunneler_dialog():
             _caver_msg("No tunnel PDB files found in clusters_timeless.")
             return False
 
-        # Input structure: sibling <run>/inputs/*.pdb (run root = parent of the 'data' dir);
-        # else a non-origin .pdb in the clusters' parent 'data' dir.
-        data_dir = os.path.dirname(clusters_dir)
-        run_root = os.path.dirname(data_dir)
-        protein_pdb = None
-        inputs_dir = os.path.join(run_root, 'inputs')
-        if os.path.isdir(inputs_dir):
-            cand = [f for f in sorted(os.listdir(inputs_dir)) if f.lower().endswith('.pdb')]
-            if cand:
-                protein_pdb = os.path.join(inputs_dir, cand[0])
-        if protein_pdb is None:
-            cand = [f for f in sorted(os.listdir(data_dir))
-                    if f.lower().endswith('.pdb') and 'origin' not in f.lower()]
-            if cand:
-                protein_pdb = os.path.join(data_dir, cand[0])
-        if protein_pdb is None:
-            _caver_msg("Found tunnels but no CAVER input structure (inputs/*.pdb).")
-            return False
-
         Console("OFF")
-        pre_objs = ListObj('all')                       # align candidates: objects present before import
-        prot = LoadPDB(protein_pdb, center=False, correct=False)[0]
-
-        mols = []
         alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        mols = []
         n = len(tunnel_pdbs)
-        for i, pdb in enumerate(tunnel_pdbs):
-            ShowMessage(f'Loading CAVER tunnel {i + 1} / {n}')
-            tun = LoadPDB(pdb, center=False, correct=False)[0]
-            ColorObj(tun, int(360 / n * i))
-            molname = 't' + alphabet[i % len(alphabet)]
-            NameMol(f'obj {tun}', molname)
-            mols.append(molname)
-            JoinObj(tun, prot)
-            Wait(1)
-        HideMessage()
-        NameObj(prot, 'caver')
-        Console("hidden")
 
-        # Optional SHEBA alignment onto a pre-existing object (moves the joined tunnels too).
-        if offer_align and pre_objs:
-            tgt = _ask_align_target(pre_objs)
-            if tgt is not None:
-                Console("OFF")
-                ShowMessage('Aligning CAVER structure...')
-                AlignObj(prot, tgt, method='sheba')
-                HideMessage()
+        def _load_tunnels_into(base):
+            """Load every tunnel PDB (center=False keeps CAVER's frame), colour by hue, rename
+            its molecule tA/tB..., and join into `base` (or become `base` if it's None). Returns
+            the base object number."""
+            for i, pdb in enumerate(tunnel_pdbs):
+                ShowMessage(f'Loading CAVER tunnel {i + 1} / {n}')
+                tun = LoadPDB(pdb, center=False, correct=False)[0]
+                ColorObj(tun, int(360 / n * i))
+                molname = 't' + alphabet[i % len(alphabet)]
+                NameMol(f'obj {tun}', molname)
+                mols.append(molname)
+                if base is None:
+                    base = tun
+                else:
+                    JoinObj(tun, base)
+                Wait(1)
+            HideMessage()
+            return base
+
+        if frame_obj is not None:
+            # Place the tunnels straight into the original structure's frame -- no input copy.
+            prot = _load_tunnels_into(None)
+            po = PosOriObj(frame_obj)                    # x, y, z, alpha, beta, gamma
+            PosOriObj(prot, po[0], po[1], po[2], po[3], po[4], po[5])
+            NameObj(prot, 'caver')
+        else:
+            # Manual Import: no original in the scene, so load CAVER's own input copy as the base
+            # (sibling <run>/inputs/*.pdb, else a non-origin .pdb in the clusters' 'data' dir).
+            data_dir = os.path.dirname(clusters_dir)
+            run_root = os.path.dirname(data_dir)
+            protein_pdb = None
+            inputs_dir = os.path.join(run_root, 'inputs')
+            if os.path.isdir(inputs_dir):
+                cand = [f for f in sorted(os.listdir(inputs_dir)) if f.lower().endswith('.pdb')]
+                if cand:
+                    protein_pdb = os.path.join(inputs_dir, cand[0])
+            if protein_pdb is None:
+                cand = [f for f in sorted(os.listdir(data_dir))
+                        if f.lower().endswith('.pdb') and 'origin' not in f.lower()]
+                if cand:
+                    protein_pdb = os.path.join(data_dir, cand[0])
+            if protein_pdb is None:
                 Console("hidden")
+                _caver_msg("Found tunnels but no CAVER input structure (inputs/*.pdb).")
+                return False
+            pre_objs = ListObj('all')                    # align candidates: objects present before import
+            prot = _load_tunnels_into(LoadPDB(protein_pdb, center=False, correct=False)[0])
+            NameObj(prot, 'caver')
+            Console("hidden")
+            # Optional SHEBA alignment onto a pre-existing object (moves the joined tunnels too).
+            if offer_align and pre_objs:
+                tgt = _ask_align_target(pre_objs)
+                if tgt is not None:
+                    Console("OFF")
+                    ShowMessage('Aligning CAVER structure...')
+                    AlignObj(prot, tgt, method='sheba')
+                    HideMessage()
+                    Console("hidden")
 
         Console("OFF")
         HideObj(prot)
@@ -1395,8 +1418,9 @@ def tunneler_dialog():
             return home
         return _download_caver_with_progress()
 
-    def _poll_caver(proc, out_dir):
-        """Poll the CAVER subprocess (non-blocking) and auto-import on success."""
+    def _poll_caver(proc, out_dir, frame_obj=None):
+        """Poll the CAVER subprocess (non-blocking) and auto-import on success. `frame_obj` is
+        the original structure's object number, so the tunnels land in its frame (no copy)."""
         pw = tk.Toplevel(root)
         pw.title('Running CAVER')
         pw.attributes('-topmost', True)
@@ -1423,7 +1447,7 @@ def tunneler_dialog():
                         detail = f.read().strip()
                 _caver_msg('CAVER found no tunnels from this starting point.\n' + detail[:250], secs=120)
                 return
-            _import_caver_from(out_dir, offer_align=False)
+            _import_caver_from(out_dir, offer_align=False, frame_obj=frame_obj)
 
         root.after(300, _check)
 
@@ -1748,7 +1772,7 @@ def tunneler_dialog():
                                           max_distance=caver_md))
             proc = caver.start_caver(caver.find_java(), home, in_dir, cfg_path, out_dir)
             win.destroy()
-            _poll_caver(proc, out_dir)
+            _poll_caver(proc, out_dir, frame_obj=prot_obj)
 
         def _cancel():
             Console("OFF"); _clear_preview(); Console("hidden")
