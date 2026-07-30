@@ -389,8 +389,9 @@ def project_points_onto_plane(points, plane_points):
     u = v1 / np.linalg.norm(v1)
     v = np.cross(plane_normal, u)
 
-    # Transform the projected points to the 2D plane coordinates
-    points_2d = np.array([[np.dot(p, u), np.dot(p, v)] for p in projected_points])
+    # Transform the projected points to the 2D plane coordinates (B6: exact
+    # vectorization of the old per-point [[p·u, p·v] for p ...] list comprehension).
+    points_2d = np.column_stack((projected_points @ u, projected_points @ v))
 
     return points_2d, np.arange(len(points)), plane_points[0], u, v
 

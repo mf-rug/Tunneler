@@ -421,24 +421,29 @@ def create_surrounding_points(points, spacing, remove_edge=True):
     Used to build the rough surface point cloud around protein atoms.
     When remove_edge=True, only keeps neighbors that share at least one
     coordinate with the original point (i.e. face/edge neighbors, not pure corners).
+
+    Vectorized (B3): the old per-point Python triple-loop + itertools.product
+    (~O(27N) in Python) is one numpy broadcast. Output is BYTE-IDENTICAL to the old
+    version, including the cross-axis quirk of the old ``any(item in point ...)`` edge
+    test -- a pure-corner neighbor is kept when a shifted coord happens to equal ANY
+    original coord, not just the same-axis one -- so the rough surface, and thus tunnel
+    detection, is unchanged (verified against the harness fingerprints).
     """
-    all_coords = []
-    for point in points:
-        cube_coords = []
-        for i in range(len(point)):
-            grid_points = [point[i], point[i] - spacing, point[i] + spacing]
-            cube_coords.append(grid_points)
-        all_coords.append(cube_coords)
-    all_permuts = []
-    for i in range(len(all_coords)):
-        coord = all_coords[i]
-        point = points[i]
-        coord_permuts = list(itertools.product(coord[0],coord[1],coord[2],))
-        if remove_edge:
-            coord_permuts = [tup for tup in coord_permuts if any(item in point for item in tup)]
-        all_permuts.append(coord_permuts)
-    ret_coords = np.array([point for sublist in all_permuts for point in sublist])
-    return(np.unique(ret_coords, axis=0))
+    pts = np.asarray(points, dtype=float)
+    if len(pts) == 0:
+        return np.unique(pts.reshape(-1, 3), axis=0)
+    offsets = np.array([0.0, -spacing, spacing])
+    # 27 offset combinations, same [0, -s, +s] per-axis order as the old itertools.product
+    combos = np.array(list(itertools.product(offsets, offsets, offsets)))   # (27, 3)
+    cand = pts[:, None, :] + combos[None, :, :]                             # (N, 27, 3)
+    if remove_edge:
+        # Keep a neighbour if any of its 3 coords equals any of its origin's 3 coords --
+        # reproduces the old cross-axis ``any(item in point for item in tup)`` exactly.
+        keep = (cand[:, :, :, None] == pts[:, None, None, :]).any(axis=(2, 3))   # (N, 27)
+        cand = cand[keep]
+    else:
+        cand = cand.reshape(-1, 3)
+    return np.unique(cand, axis=0)
 
 
 # ============================================================
