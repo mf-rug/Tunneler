@@ -3142,10 +3142,14 @@ def tunneler_dialog():
                 tooltip_window = tk.Toplevel(widget)
                 tooltip_window.wm_overrideredirect(True)
                 tooltip_window.wm_geometry(f"+{x}+{y}")
+                # Set BOTH colours explicitly: with only a background, the label inherits
+                # the theme's default foreground, which is white on some systems -> white
+                # text on yellow, illegible. Black-on-pale-yellow is legible everywhere.
                 label = tk.Label(tooltip_window, text=text, justify='left',
-                                background='lightyellow', relief='solid', borderwidth=0.2,
+                                background='#ffffcc', foreground='black',
+                                relief='solid', borderwidth=1,
                                 font=("tahoma", "8", "normal"))
-                label.pack(ipadx=1, ipady=26)
+                label.pack(ipadx=4, ipady=3)
                 tooltip_window.lift()
                 tooltip_window.transient(widget.winfo_toplevel())
 
@@ -3171,6 +3175,39 @@ def tunneler_dialog():
                                   "after detection (opaque tunnels draw as their surface shell only;\n"
                                   "the tunnel data stays exact -- pathfinding/cross-section/volume\n"
                                   "are unaffected). Unchecked = full quality (the default).")
+
+    # --- Tab-1 input-setting tooltips ---------------------------------------
+    create_tooltip(ign_surf_scale,
+                   "Ignore surface up to (Å): points within this distance of the protein's\n"
+                   "solvent-accessible surface are treated as exterior and excluded from the\n"
+                   "tunnel search. Higher = strip more of the outer layer.")
+    create_tooltip(surf_con_scale,
+                   "Surface connect (Å): extra margin used when deciding whether a tunnel\n"
+                   "reaches the surface, to suppress spurious tunnel-to-surface connections.\n"
+                   "Higher = harder for a tunnel to be counted as opening to the outside.")
+    create_tooltip(prot_space_scale,
+                   "Protein spacing (Å): maximum allowed distance between a grid point and\n"
+                   "the nearest protein atom -- how tightly the point cloud hugs the protein.")
+    create_tooltip(min_vol_scale,
+                   "Minimum volume (Å³): clusters smaller than this are discarded, so only\n"
+                   "tunnels above this size are reported. Higher = fewer, larger tunnels.")
+    create_tooltip(num_md_scale,
+                   "MD steps: number of molecular-dynamics refinement iterations (0 = none).\n"
+                   "More steps relax the structure before detection but cost time.")
+    create_tooltip(ball_spacing_scale,
+                   "Ball spacing (Å): grid resolution of the tunnel point cloud -- the core\n"
+                   "detection setting. Smaller = finer tunnels but much slower (cost scales as\n"
+                   "spacing^-3). The available range depends on the Fast/Quality mode.")
+    create_tooltip(connect_cut_scale,
+                   "Connect cutoff (× ball spacing): how far apart two points can be and still\n"
+                   "count as one tunnel (DBSCAN eps = ball spacing × this). Higher merges\n"
+                   "nearby tunnels; lower splits them.")
+    create_tooltip(listbox,
+                   "Exclude residues: select residue types to remove before detection\n"
+                   "(e.g. ligands or cofactors that would block a tunnel). Multi-select.")
+    create_tooltip(polygon_button,
+                   "Build hull polygon: draw the convex-hull envelope used during detection.\n"
+                   "Purely a visual aid; does not change the detected tunnels.")
 
     button2 = ttk.Button(tab2_appear)
     button2.configure(style="Toolbutton", text='Recluster', command=Recluster)
