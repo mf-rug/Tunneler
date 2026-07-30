@@ -212,7 +212,6 @@ import os
 import tempfile
 from configparser import ConfigParser
 from Tunneler_function_con import *
-import threading
 import tkinter as tk
 import tkinter.ttk as ttk
 from Tunneler_diameter_functions import *
@@ -2042,14 +2041,14 @@ def tunneler_dialog():
 
 
     def show_progress_tunneler():
-        """Create a progress window and run the Tunneler pipeline (called in a thread)."""
+        """Create a progress window and run the Tunneler pipeline (on the main thread)."""
         Console("OFF")
         global progress_window, progress_var, percent_label, initializing
         initializing = True
         progress_window = tk.Toplevel(root)
         progress_window.title("Creating tunnels")
         progress_window.lift()
-        progress_window.attributes("-topmost", True) 
+        progress_window.attributes("-topmost", True)
         progress_var = tk.IntVar()
         progress_bar = ttk.Progressbar(progress_window, orient="horizontal", length=200, mode="determinate", variable=progress_var, maximum=100)
         progress_bar.pack(padx=5, pady=5)
@@ -2057,6 +2056,9 @@ def tunneler_dialog():
         percent_label.pack(pady=5)
 
         _attach_elapsed_timer(progress_window)
+        # Render the popup now: detection blocks the main thread, so the tk loop won't
+        # get another chance to paint until _prog()'s update_idletasks() pump kicks in.
+        progress_window.update()
 
         # A fresh prediction rebuilds the clusters -> drop any stashed sphere/shape cache
         # sets (objects + state), else stale shpV/A/M### / sphT/D### objects linger and a
@@ -2104,7 +2106,12 @@ def tunneler_dialog():
     def run_tun(*args):
         Console("OFF")
         UnselectAll()
-        threading.Thread(target=show_progress_tunneler).start()
+        # Run detection on the MAIN thread (not a worker). YASARA's command socket is a
+        # single unsynchronized global, and tkinter is not thread-safe -- a worker thread
+        # doing both (as this used to) is only "safe" by the fragile invariant that no
+        # main-thread callback touches YASARA/tk meanwhile. Running inline removes both
+        # races; the progress bar + clock stay live via _prog()'s update_idletasks() pump.
+        show_progress_tunneler()
 
 
     run_tun_button = ttk.Button(tab1_mktun)

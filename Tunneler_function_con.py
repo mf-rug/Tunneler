@@ -813,13 +813,22 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
     # gap). The two dominant phases -- loading the point cloud (CIF chunk loop) and
     # clustering (per-cluster loop) -- get per-item callbacks so their bands fill
     # smoothly; the monolithic YASARA ops between them just step to the next milestone.
-    # Runs in the Tunneler worker thread, so callbacks only set the IntVar/label; the main
-    # tk loop repaints (no update_idletasks() from a worker thread).
+    # Detection runs on the MAIN thread (see run_tun -> show_progress_tunneler), so the
+    # tk event loop is blocked here: pump the bar + elapsed clock manually, exactly like
+    # the recluster/sphere builds. update_idletasks() (NOT update()) redraws WITHOUT
+    # processing user/window events -> no re-entrancy into other callbacks and no chance
+    # of a nested YASARA command racing on the (unsynchronized) command socket.
     _has_prog = progress_var != None and percent_label != None
     def _prog(pct):
         if _has_prog:
             progress_var.set(int(pct))
             percent_label.config(text=f'{int(pct)}%')
+            try:
+                top = percent_label.winfo_toplevel()
+                getattr(top, '_elapsed_manual', lambda: None)()   # tick the MM:SS clock
+                top.update_idletasks()
+            except Exception:
+                pass
     def _band(lo, hi):
         # Return a 0..1 -> [lo,hi] progress callback, or None when there is no bar.
         return (lambda f: _prog(lo + (hi - lo) * f)) if _has_prog else None
