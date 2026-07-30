@@ -214,6 +214,7 @@ from configparser import ConfigParser
 from Tunneler_function_con import *
 import tkinter as tk
 import tkinter.ttk as ttk
+import tkinter.filedialog as filedialog
 from Tunneler_diameter_functions import *
 from sklearn.cluster import DBSCAN
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -1134,6 +1135,218 @@ def tunneler_dialog():
             SwitchObj(o, 'On' if f'{o:03d}' in on_nums else 'Off')
         Console("hidden")
         SaveSce(f'{NameObj(tar)[0]}_tunnels_exit.sce')
+
+    def save_scene():
+        """Explicit 'Save' button: write the CURRENT scene to a user-chosen .sce, exactly as
+        shown. Unlike the Exit auto-snapshot (which strips the heavy sphere/shape meshes to
+        keep the file small), this preserves the live view -- so a nice sphere/shape
+        visualization round-trips -- and never mutates the scene the user is looking at.
+        The 11 detection settings ride along automatically as object key-value pairs
+        (PairObj, written every detection run) and are read back on Load."""
+        tar = target()
+        Console("OFF")
+        default = f'{NameObj(tar)[0]}_tunnels.sce' if tar is not None else 'tunnels.sce'
+        Console("hidden")
+        path = filedialog.asksaveasfilename(
+            parent=root, title='Save tunnel scene', initialfile=default,
+            defaultextension='.sce', filetypes=[('YASARA scene', '*.sce')])
+        if not path:
+            return
+        Console("OFF")
+        # Persist the appearance state that CAN'T be read back from the baked scene, so Load
+        # can restore Tab-2 exactly. These ride in the .sce as object key-value pairs, same
+        # as the detection settings. (Display mode's sphere/shape cases are recovered from
+        # object visibility on load; view_mode only disambiguates points-vs-balls, and
+        # col_mode is needed because Colorbytunnel doesn't clear dist_sel.)
+        if tar is not None:
+            PairObj(tar, 'view_mode', radio_var.get())      # points | balls | spheres | shape
+            PairObj(tar, 'col_mode', radio_col_var.get())   # tunnel | distance
+            PairObj(tar, 'sph_alpha', alpha_chk.get())      # sphere transparency
+            PairObj(tar, 'sph_size', rad_chk.get())         # sphere / ball radius
+            PairObj(tar, 'sph_fast', fast_chk.get())        # flat (fast) vs smooth shading
+        SaveSce(path)
+        Console("hidden")
+
+    def _post_load_menu():
+        """Drop the Load menu just below the Load button."""
+        try:
+            x = load_button.winfo_rootx()
+            y = load_button.winfo_rooty() + load_button.winfo_height()
+            load_menu.tk_popup(x, y)
+        finally:
+            load_menu.grab_release()
+
+    def load_tunneler_scene():
+        """Load a previously saved Tunneler .sce and re-sync the dialog to it (Tab-1
+        detection knobs from the object's PairObj keys, plus the recoverable Tab-2/3
+        appearance state). Placeholder body filled in phase (c)."""
+        Console("OFF")
+        path = filedialog.askopenfilename(
+            parent=root, title='Load Tunneler scene',
+            filetypes=[('YASARA scene', '*.sce'), ('All files', '*')])
+        Console("hidden")
+        if not path:
+            return
+        Console("OFF")
+        LoadSce(path)
+        Console("hidden")
+        _sync_dialog_to_scene()
+
+    def import_caver():
+        """Import CAVER tunnel output into the scene. Implemented in phase (d)."""
+        Console("OFF")
+        ShowMessage('CAVER import is not wired up yet.')
+        Wait(30)
+        HideMessage()
+        Console("hidden")
+
+    def _sync_dialog_to_scene():
+        """After LoadSce, make the dialog reflect the freshly loaded scene: refresh the
+        target dropdown + ignore-residue list, restore the Tab-1 detection knobs from the
+        target object's PairObj keys (the exact values that produced this scene -- they
+        drive the next detection run), and re-derive the recoverable Tab-2/3 appearance
+        state. Alpha and sphere size aren't stored in a readable form, so those widgets
+        keep their current values; that's the one gap vs a perfect round-trip.
+
+        Setting a Scale/Radiobutton/Checkbutton *variable* does not fire its command
+        callback (only user clicks do), so pushing values here is side-effect-free apart
+        from the connect_cut trace (a harmless round+relabel) and the target_option trace
+        (which rebuilds the residue list -- wanted). `initializing` is held True across the
+        sync as a belt-and-braces guard for any inspect callbacks."""
+        global initializing
+        Console("OFF")
+        was_initializing = initializing
+        initializing = True
+        try:
+            # --- refresh target dropdown to the loaded scene's objects ---
+            opts = ListObj('All', format='OBJNUM: OBJNAME')
+            # ttk.OptionMenu['menu'] returns a Menu object on some Python builds and a Tcl
+            # path string on others -- normalise to the widget so .delete/.add work either way.
+            menu = dropdown['menu']
+            if isinstance(menu, str):
+                menu = dropdown.nametowidget(menu)
+            menu.delete(0, 'end')
+            for opt in opts:
+                menu.add_command(label=opt, command=tk._setit(target_option, opt))
+
+            def _optnum(o):
+                m = re.findall(r'\d+(?=:)', o)
+                return m[0] if m else None
+
+            tar = target()
+            match = next((o for o in opts if _optnum(o) == tar), opts[0] if opts else '')
+            target_option.set(match)          # trace -> target_changed() rebuilds the listbox
+
+            if tar is None:
+                return
+
+            def _pv(key):
+                v = PairObj(tar, key)
+                return v[0] if v else None
+
+            # --- Tab-1 detection knobs from PairObj ---
+            for var, key, label, dec in (
+                    (ign_surf_scale_chk,   'ignore_surface',   ign_surf_value_label,   1),
+                    (surf_con_scale_chk,   'surf_con_prev',    surf_con_value_label,   1),
+                    (prot_space_scale_chk, 'max_ball_protein', prot_space_value_label, 2),
+                    (min_vol_scale_chk,    'min_vol',          min_vol_value_label,    0)):
+                v = _pv(key)
+                if v is None:
+                    continue
+                try:
+                    var.set(float(v))
+                except (ValueError, TypeError):
+                    continue
+                update_label(var, label, dec)
+
+            for var, key, label in ((num_md_scale_chk, 'mds', num_md_value_label),
+                                    (connect_cut_scale_chk, 'connect_cut', None)):
+                v = _pv(key)
+                if v is None:
+                    continue
+                try:
+                    var.set(int(float(v)))
+                except (ValueError, TypeError):
+                    continue
+                if label is not None:
+                    update_label(var, label, 0)
+
+            v = _pv('build_pol')
+            if v is not None:
+                polygon_chk.set(str(v) == 'True')
+            v = _pv('prog')
+            if v in ('fast', 'vis', 'wait'):
+                show_prog_var.set(v)
+
+            # performant mode first, then re-range the ball slider, then the ball value
+            # last so it isn't clamped by a stale range.
+            v = _pv('performant_mode')
+            if v is not None:
+                performant_mode_var.set(str(v) == 'True')
+            _apply_ball_range()
+            v = _pv('ball_spacing')
+            if v is not None:
+                try:
+                    ball_spacing_scale_chk.set(float(v))
+                    update_label(ball_spacing_scale_chk, ball_spacing_value_label, 2)
+                except (ValueError, TypeError):
+                    pass
+
+            # --- Tab-2 appearance (recoverable subset) ---
+            tunnel_chk.set(bool(switch_status(f'{tar}Cl???????')))
+            target_chk.set(bool(switch_status(tar)))
+            # Display mode from what is actually VISIBLE, not what merely exists: the
+            # sphere/shape meshes are built once then toggled on/off, so their existence
+            # doesn't imply they're the current view. Visibility is authoritative for the
+            # mesh modes; points-vs-balls (both just the cluster objects, distinguished only
+            # by atom style, which has no getter) falls back to the saved view_mode key.
+            def _any_on(sel):
+                return ListObj(sel) != [] and any(s == 'On' for s in SwitchObj(sel))
+            if _any_on('???_Sphere'):
+                radio_var.set('spheres')
+            elif _any_on('???_shape'):
+                radio_var.set('shape')
+            else:
+                vm = _pv('view_mode')
+                radio_var.set('balls' if vm == 'balls' else 'points')
+
+            # Colour mode: authoritative from the saved col_mode; older scenes (saved before
+            # it was persisted) fall back to the dist_sel heuristic -- imperfect, since
+            # Colorbytunnel leaves dist_sel set, but the best available for legacy files.
+            cm = _pv('col_mode')
+            if cm in ('tunnel', 'distance'):
+                radio_col_var.set(cm)
+            else:
+                dsel = PairObj(tar, 'dist_sel')
+                radio_col_var.set('distance' if (dsel and dsel[0]) else 'tunnel')
+
+            # Sphere alpha / size / shading -- not recoverable from the scene, restored from
+            # the keys save_scene wrote. Clamp to the spinbox ranges (alpha 1-100, size 4-100).
+            a = _pv('sph_alpha')
+            if a is not None:
+                try:
+                    alpha_chk.set(max(1, min(100, int(float(a)))))
+                except (ValueError, TypeError):
+                    pass
+            s = _pv('sph_size')
+            if s is not None:
+                try:
+                    rad_chk.set(max(4, min(100, int(float(s)))))
+                except (ValueError, TypeError):
+                    pass
+            f = _pv('sph_fast')
+            if f is not None:
+                fast_chk.set(str(f) == 'True')
+
+            # Refresh the Tab-3 inspect dropdown to the loaded scene's tunnels (same rebuild
+            # detection does), else it still lists the previous scene's tunnels.
+            insp = ['All']
+            for x in ListObj(f'{tar}Cl???????', format='OBJNUM: OBJNAME'):
+                insp.append(x)
+            update_option_menu(tab3_inspect, tnl_insp_option, insp, current_value='All')
+        finally:
+            initializing = was_initializing
+            Console("hidden")
 
     def Balls():
         """Switch tunnel display to ball-stick mode."""
@@ -3414,9 +3627,22 @@ def tunneler_dialog():
         _macos_set_accessory(True)                   # attached by default
     _follow_tick()                                   # start the poll loop
 
+    # Bottom-row actions: Load (dropdown) | Save | Exit, right-aligned so the
+    # Follow-YASARA checkbox keeps the left side. Widths are snug (~4-char labels);
+    # nudge the x offsets if the theme font makes them overlap the checkbox.
+    load_menu = tk.Menu(root, tearoff=0)
+    load_menu.add_command(label='Tunneler scene…', command=load_tunneler_scene)
+    load_menu.add_command(label='Import CAVER…', command=import_caver)
+
+    load_button = ttk.Button(root, text='Load', width=5, command=_post_load_menu)
+    load_button.place(anchor="nw", x=170, y=401)
+
+    save_button = ttk.Button(root, text='Save', width=5, command=save_scene)
+    save_button.place(anchor="nw", x=218, y=401)
+
     button4 = ttk.Button(root)
     button4.configure(text='Exit', command=on_cancel)
-    button4.place(anchor="nw", x=256, y=401)
+    button4.place(anchor="nw", x=266, y=401)
 
     separator7 = ttk.Separator(root)
     separator7.configure(orient="horizontal")
