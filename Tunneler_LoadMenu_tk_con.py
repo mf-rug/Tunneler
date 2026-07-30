@@ -1472,10 +1472,15 @@ def tunneler_dialog():
                 _caver_msg('Click an atom in YASARA to mark it (white firefly), then press this again.')
                 return
             sel = 'Atom ' + ' '.join(str(a) for a in marked)
-            pos = PosAtom(sel, coordsys='global')
+            # Use LOCAL coords with X negated: that is exactly the frame SavePDB(transform=
+            # 'No') writes, so the start point and the saved structure share one frame. Do
+            # NOT use PosAtom 'global' + SavePDB default -- YASARA's centering rotation plus
+            # its PDB X-flip put those in different frames, so the start point landed nowhere
+            # near the protein and every run silently found zero tunnels.
+            pos = PosAtom(sel, coordsys='local')
             Console("hidden")
             k = len(marked)
-            start_point['xyz'] = (sum(pos[0::3]) / k, sum(pos[1::3]) / k, sum(pos[2::3]) / k)
+            start_point['xyz'] = (-sum(pos[0::3]) / k, sum(pos[1::3]) / k, sum(pos[2::3]) / k)
             x, y, z = start_point['xyz']
             start_lbl.config(text=f'{x:.2f}, {y:.2f}, {z:.2f}', foreground='black')
 
@@ -1520,7 +1525,10 @@ def tunneler_dialog():
             # and discard the copy. Non-water ligands/cofactors are kept (obstacles).
             dup = DuplicateObj(prot_obj)[0]
             DelRes(f'Obj {dup} Res HOH')
-            SavePDB(f'Obj {dup}', os.path.join(in_dir, 'structure.pdb'))
+            # transform='No' writes the object's LOCAL frame (X-flipped for PDB), matching
+            # the local/X-negated start point above -- see _capture_start. Using the default
+            # (transform='Yes') bakes in the centering rotation and desyncs the two frames.
+            SavePDB(f'Obj {dup}', os.path.join(in_dir, 'structure.pdb'), transform='No')
             DelObj(dup)
             Console("hidden")
             cfg_path = os.path.join(run_dir, 'config.txt')
