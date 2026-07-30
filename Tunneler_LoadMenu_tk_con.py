@@ -1474,19 +1474,23 @@ def tunneler_dialog():
 
         def _capture_start():
             Console("OFF")
-            sel = ListAtom('Selected')
-            if not sel:
+            # Clicking an atom in YASARA MARKS it (white firefly); MarkAtom() returns up to
+            # four marked atom numbers (0 = that slot unmarked). Use the marked atom(s), not
+            # the selection -- a click doesn't 'select'.
+            marked = [a for a in MarkAtom() if a]
+            if not marked:
                 Console("hidden")
-                _caver_msg('Select an atom or residue in YASARA (click it in the scene), then press this again.')
+                _caver_msg('Click an atom in YASARA to mark it (white firefly), then press this again.')
                 return
-            pos = PosAtom('Selected', coordsys='global')
+            sel = 'Atom ' + ' '.join(str(a) for a in marked)
+            pos = PosAtom(sel, coordsys='global')
             Console("hidden")
-            k = len(sel)
+            k = len(marked)
             start_point['xyz'] = (sum(pos[0::3]) / k, sum(pos[1::3]) / k, sum(pos[2::3]) / k)
             x, y, z = start_point['xyz']
             start_lbl.config(text=f'{x:.2f}, {y:.2f}, {z:.2f}', foreground='black')
 
-        ttk.Button(win, text='Use YASARA selection', command=_capture_start).grid(
+        ttk.Button(win, text='Use marked atom', command=_capture_start).grid(
             row=1, column=2, sticky='w', **pad)
 
         # Parameters -----------------------------------------------------------
@@ -3734,9 +3738,11 @@ def tunneler_dialog():
                 nonlocal tooltip_window
                 if tooltip_window:
                     return
-                x, y, width, height = widget.bbox("insert")
-                x = x + widget.winfo_rootx() + 20
-                y = y + height + widget.winfo_rooty() + 20
+                # Position below the widget's top-left. Do NOT use bbox("insert"): that
+                # index is only valid for text-entry widgets (Entry/Text/Spinbox) and raises
+                # TclError on a Listbox/Scale/Label/Button. Widget geometry works for any.
+                x = widget.winfo_rootx() + 20
+                y = widget.winfo_rooty() + widget.winfo_height() + 5
                 tooltip_window = tk.Toplevel(widget)
                 tooltip_window.wm_overrideredirect(True)
                 tooltip_window.wm_geometry(f"+{x}+{y}")
