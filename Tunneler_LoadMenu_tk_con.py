@@ -783,6 +783,21 @@ def _union_shape_mesh(centers, colors, radius, alpha, voxel=0.3, smooth=0.8,
     return j
 
 
+def _dup_hidden_obj(src, newname):
+    """Duplicate `src` into a fresh, switched-on but fully hidden object named
+    `newname` (backbone atoms + secondary structure both hidden, nothing shown
+    yet), and return the new object number. The caller then reveals only the
+    residues it wants (ShowRes etc.) -- which target by object number, so it does
+    not matter that the rename happens here first. Shared by the Nonprot / H2O /
+    Surf display toggles."""
+    new = DuplicateObj(src)[0]
+    SwitchObj(new, 'ON')
+    HideObj(new)
+    HideSecStrObj(new)
+    NameObj(new, newname)
+    return new
+
+
 def tunneler_dialog():
     """Build and run the 3-tab Tunneler tkinter dialog.
 
@@ -984,12 +999,8 @@ def tunneler_dialog():
         Console("OFF")
         tar = target()
         if ListObj(f'{tar}NonProt', format='OBJNUM') == []:
-            new = DuplicateObj(tar)[0]
-            SwitchObj(new, 'ON')
-            HideObj(new)
-            HideSecStrObj(new)
+            new = _dup_hidden_obj(tar, f'{tar}NonProt')
             ShowRes(f'Obj {new} res !protein and !hoh')
-            NameObj(new, f'{tar}NonProt')
         else:
             SwitchObj(f'{tar}NonProt', convert_status(nonprot_chk.get()))       
         Wait(1)
@@ -1000,12 +1011,8 @@ def tunneler_dialog():
         Console("OFF")
         tar = target()
         if ListObj(f'{tar}H2O', format='OBJNUM') == []:
-            new = DuplicateObj(tar)[0]
-            SwitchObj(new, 'ON')
-            HideObj(new)
-            HideSecStrObj(new)
+            new = _dup_hidden_obj(tar, f'{tar}H2O')
             ShowRes(f'Obj {new} res hoh')
-            NameObj(new, f'{tar}H2O')
         else:
             SwitchObj(f'{tar}H2O', convert_status(h2o_chk.get()))       
         Wait(1)
@@ -1017,11 +1024,7 @@ def tunneler_dialog():
             Console("OFF")
         tar = target()
         if ListObj(f'{tar}Surf') == []:
-            new = DuplicateObj(tar)[0]
-            SwitchObj(new, 'ON')
-            HideObj(new)
-            HideSecStrObj(new)
-            NameObj(new, f'{tar}Surf')
+            _dup_hidden_obj(tar, f'{tar}Surf')
             on_cut()
             return
         if surf_col.get() == 'choose..':
