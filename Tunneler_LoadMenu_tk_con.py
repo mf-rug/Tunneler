@@ -217,6 +217,8 @@ import tkinter.ttk as ttk
 import tkinter.filedialog as filedialog
 import tkinter.messagebox as messagebox
 import time
+import tempfile
+import Tunneler_caver as caver
 from Tunneler_diameter_functions import *
 from sklearn.cluster import DBSCAN
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -1261,23 +1263,16 @@ def tunneler_dialog():
             NameObj(jobj, 'caver_sphere')
         Console("hidden")
 
-    def import_caver():
-        """Import CAVER tunnel output as a rainbow 'beads on a string' overlay.
-
-        Pick a CAVER output folder; we locate .../data/clusters_timeless/*.pdb (per-cluster
-        tunnel pseudo-atom strings, B-factor = tunnel radius) and the input structure at the
-        sibling .../inputs/*.pdb. Each cluster becomes a molecule tA, tB... joined into one
-        'caver' object and coloured by hue, then every pseudo-atom is drawn as a sphere sized
-        by its B-factor. Optionally SHEBA-aligns onto a loaded object (moving the tunnels with
-        it) so the overlay matches your working structure."""
-        Console("OFF")
-        folder = filedialog.askdirectory(
-            parent=root, title="Select the CAVER output folder (contains data/clusters_timeless)")
-        Console("hidden")
-        if not folder:
-            return
-
-        # Locate clusters_timeless anywhere under the selection.
+    def _import_caver_from(folder, offer_align=True):
+        """Import CAVER output under `folder` as a rainbow 'beads on a string' overlay:
+        locate .../clusters_timeless/*.pdb (per-cluster pseudo-atom strings, B-factor =
+        tunnel radius) and the input structure (sibling .../inputs/*.pdb, else a non-origin
+        .pdb in the clusters' parent data/ dir). Each cluster becomes a molecule tA, tB...
+        joined into one 'caver' object coloured by hue, hidden, then every pseudo-atom drawn
+        as a sphere sized by its B-factor. When `offer_align` and other objects are loaded,
+        prompts to SHEBA-align onto one (moving the joined tunnels with it). Returns True on
+        success. Shared by manual Import and the Run-CAVER auto-import (which passes
+        offer_align=False -- fresh output is already in the loaded structure's frame)."""
         clusters_dir = None
         for dirpath, _dirs, _files in os.walk(folder):
             if os.path.basename(dirpath) == 'clusters_timeless':
@@ -1285,12 +1280,12 @@ def tunneler_dialog():
                 break
         if clusters_dir is None:
             _caver_msg("No 'clusters_timeless' folder found under the selection.")
-            return
+            return False
         tunnel_pdbs = sorted(os.path.join(clusters_dir, f)
                              for f in os.listdir(clusters_dir) if f.lower().endswith('.pdb'))
         if not tunnel_pdbs:
             _caver_msg("No tunnel PDB files found in clusters_timeless.")
-            return
+            return False
 
         # Input structure: sibling <run>/inputs/*.pdb (run root = parent of the 'data' dir);
         # else a non-origin .pdb in the clusters' parent 'data' dir.
@@ -1309,7 +1304,7 @@ def tunneler_dialog():
                 protein_pdb = os.path.join(data_dir, cand[0])
         if protein_pdb is None:
             _caver_msg("Found tunnels but no CAVER input structure (inputs/*.pdb).")
-            return
+            return False
 
         Console("OFF")
         pre_objs = ListObj('all')                       # align candidates: objects present before import
@@ -1332,7 +1327,7 @@ def tunneler_dialog():
         Console("hidden")
 
         # Optional SHEBA alignment onto a pre-existing object (moves the joined tunnels too).
-        if pre_objs:
+        if offer_align and pre_objs:
             tgt = _ask_align_target(pre_objs)
             if tgt is not None:
                 Console("OFF")
@@ -1345,6 +1340,197 @@ def tunneler_dialog():
         HideObj(prot)
         _show_caver_spheres(f'Obj {prot} Mol {" ".join(mols)}')
         Console("hidden")
+        return True
+
+    def import_caver():
+        """Manual 'Import CAVER': pick an output folder, then hand off to _import_caver_from."""
+        Console("OFF")
+        folder = filedialog.askdirectory(
+            parent=root, title="Select the CAVER output folder (contains data/clusters_timeless)")
+        Console("hidden")
+        if folder:
+            _import_caver_from(folder, offer_align=True)
+
+    def _protein_centroid(obj):
+        """Geometric centre of a loaded object's protein atoms (global coords), the default
+        CAVER start point when the user hasn't picked one."""
+        Console("OFF")
+        pos = PosAtom(f'Obj {obj} and protein', coordsys='global') or PosAtom(f'Obj {obj}', coordsys='global')
+        Console("hidden")
+        k = len(pos) // 3
+        if k == 0:
+            return (0.0, 0.0, 0.0)
+        return (sum(pos[0::3]) / k, sum(pos[1::3]) / k, sum(pos[2::3]) / k)
+
+    def _download_caver_with_progress():
+        """Download+extract CAVER on the main thread with a progress bar (one-time setup).
+        Returns the caver home dir, or None on failure."""
+        pw = tk.Toplevel(root)
+        pw.title('Downloading CAVER')
+        pw.attributes('-topmost', True)
+        ttk.Label(pw, text='Downloading CAVER 3.0  (~130 MB, GPLv3, from caver.cz)…').pack(padx=20, pady=(15, 5))
+        pv = tk.IntVar()
+        ttk.Progressbar(pw, variable=pv, maximum=100, length=260).pack(padx=20, pady=(0, 15))
+        pw.update()
+        home = err = None
+        try:
+            home = caver.download_caver(progress_cb=lambda pct: (pv.set(pct), pw.update()))
+        except Exception as e:
+            err = str(e)
+        pw.destroy()
+        if err:
+            _caver_msg(f'CAVER download failed: {err[:200]}')
+            return None
+        caver.remember_caver_home(home)
+        return home
+
+    def _resolve_caver_home():
+        """Return a valid CAVER home, resolving via find/browse/download as needed, or None
+        if the user backs out."""
+        home = caver.find_caver_home()
+        if home:
+            return home
+        if messagebox.askyesno(
+                'CAVER not found',
+                "CAVER 3.0 wasn't found on this machine.\n\n"
+                "Yes  -  locate an existing CAVER install folder\n"
+                "No   -  download it now (~130 MB, GPLv3, from caver.cz)",
+                parent=root):
+            d = filedialog.askdirectory(parent=root, title='Select your CAVER install folder')
+            home = caver.find_caver_home(d) if d else None
+            if not home:
+                if d:
+                    _caver_msg("That folder doesn't contain caver.jar / lib.")
+                return None
+            caver.remember_caver_home(home)
+            return home
+        return _download_caver_with_progress()
+
+    def _poll_caver(proc, out_dir):
+        """Poll the CAVER subprocess (non-blocking) and auto-import on success."""
+        pw = tk.Toplevel(root)
+        pw.title('Running CAVER')
+        pw.attributes('-topmost', True)
+        ttk.Label(pw, text='Running CAVER…').pack(padx=25, pady=(15, 5))
+        pb = ttk.Progressbar(pw, mode='indeterminate', length=220)
+        pb.pack(padx=25, pady=(0, 15))
+        pb.start(12)
+
+        def _check():
+            if proc.poll() is None:
+                root.after(300, _check)
+                return
+            pb.stop()
+            pw.destroy()
+            out = proc.stdout.read() if proc.stdout else ''
+            if proc.returncode != 0:
+                _caver_msg(f'CAVER failed (exit {proc.returncode}).\n{out[-300:]}', secs=120)
+                return
+            if caver.find_clusters_timeless(out_dir) is None:
+                detail = ''
+                mp = os.path.join(out_dir, 'messages.txt')
+                if os.path.exists(mp):
+                    with open(mp) as f:
+                        detail = f.read().strip()
+                _caver_msg('CAVER found no tunnels from this starting point.\n' + detail[:250], secs=120)
+                return
+            _import_caver_from(out_dir, offer_align=False)
+
+        root.after(300, _check)
+
+    def run_caver_dialog():
+        """Configure and run CAVER on the currently selected structure, then auto-import its
+        tunnels. v1: requires an installed Java; user picks a starting point from the YASARA
+        selection (or the protein centroid); a handful of key params; runs headless."""
+        m = re.findall(r"\d+(?=:)", target_option.get())
+        if not m:
+            _caver_msg("Pick a structure in the 'Create Tunnels' tab first.")
+            return
+        prot_obj = m[0]
+
+        if not caver.find_java():
+            messagebox.showwarning(
+                'Java not found',
+                'CAVER needs a Java runtime, which was not found on your PATH.\n\n'
+                'Install a JRE (e.g. from adoptium.net) and try again.', parent=root)
+            return
+        home = _resolve_caver_home()
+        if not home:
+            return
+
+        win = tk.Toplevel(root)
+        win.title('Run CAVER')
+        win.attributes('-topmost', True)
+        pad = {'padx': 8, 'pady': 3}
+
+        ttk.Label(win, text=f'Structure:  {NameObj(prot_obj)[0]} (obj {prot_obj})',
+                  font='TkSmallCaptionFont').grid(row=0, column=0, columnspan=3, sticky='w', **pad)
+
+        # Starting point -------------------------------------------------------
+        ttk.Label(win, text='Starting point').grid(row=1, column=0, sticky='w', **pad)
+        start_lbl = ttk.Label(win, text='(protein centre)', foreground='#555')
+        start_lbl.grid(row=1, column=1, sticky='w', **pad)
+        start_point = {'xyz': None}
+
+        def _capture_start():
+            Console("OFF")
+            sel = ListAtom('Selected')
+            if not sel:
+                Console("hidden")
+                _caver_msg('Select an atom or residue in YASARA (click it in the scene), then press this again.')
+                return
+            pos = PosAtom('Selected', coordsys='global')
+            Console("hidden")
+            k = len(sel)
+            start_point['xyz'] = (sum(pos[0::3]) / k, sum(pos[1::3]) / k, sum(pos[2::3]) / k)
+            x, y, z = start_point['xyz']
+            start_lbl.config(text=f'{x:.2f}, {y:.2f}, {z:.2f}', foreground='black')
+
+        ttk.Button(win, text='Use YASARA selection', command=_capture_start).grid(
+            row=1, column=2, sticky='w', **pad)
+
+        # Parameters -----------------------------------------------------------
+        params = [('Probe radius (Å)', 'probe', '0.9'),
+                  ('Shell radius (Å)', 'shell_r', '3'),
+                  ('Shell depth', 'shell_d', '4'),
+                  ('Clustering threshold', 'clust', '3.5')]
+        pvars = {}
+        for i, (label, key, default) in enumerate(params):
+            ttk.Label(win, text=label).grid(row=2 + i, column=0, sticky='w', **pad)
+            v = tk.StringVar(value=default)
+            pvars[key] = v
+            ttk.Entry(win, textvariable=v, width=8).grid(row=2 + i, column=1, sticky='w', **pad)
+
+        def _do_run():
+            try:
+                probe = float(pvars['probe'].get())
+                shell_r = float(pvars['shell_r'].get())
+                shell_d = int(float(pvars['shell_d'].get()))
+                clust = float(pvars['clust'].get())
+            except ValueError:
+                _caver_msg('Parameters must be numbers.')
+                return
+            xyz = start_point['xyz'] or _protein_centroid(prot_obj)
+            run_dir = tempfile.mkdtemp(prefix='tunneler_caver_')
+            in_dir = os.path.join(run_dir, 'input')
+            os.makedirs(in_dir)
+            out_dir = os.path.join(run_dir, 'out')
+            Console("OFF")
+            # Water fills cavities and blocks tunnels -> exclude it from CAVER's input atoms.
+            SavePDB(f'Obj {prot_obj} Res !HOH', os.path.join(in_dir, 'structure.pdb'))
+            Console("hidden")
+            cfg_path = os.path.join(run_dir, 'config.txt')
+            with open(cfg_path, 'w') as f:
+                f.write(caver.make_config(xyz, probe_radius=probe, shell_radius=shell_r,
+                                          shell_depth=shell_d, clustering_threshold=clust))
+            proc = caver.start_caver(caver.find_java(), home, in_dir, cfg_path, out_dir)
+            win.destroy()
+            _poll_caver(proc, out_dir)
+
+        btnf = ttk.Frame(win)
+        btnf.grid(row=2 + len(params), column=0, columnspan=3, pady=(8, 10))
+        ttk.Button(btnf, text='Run', command=_do_run).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnf, text='Cancel', command=win.destroy).pack(side=tk.LEFT, padx=6)
 
     def _sync_dialog_to_scene():
         """After LoadSce, make the dialog reflect the freshly loaded scene: refresh the
@@ -3778,7 +3964,9 @@ def tunneler_dialog():
     # nudge the x offsets if the theme font makes them overlap the checkbox.
     load_menu = tk.Menu(root, tearoff=0)
     load_menu.add_command(label='Tunneler scene…', command=load_tunneler_scene)
-    load_menu.add_command(label='Import CAVER…', command=import_caver)
+    load_menu.add_separator()
+    load_menu.add_command(label='Run CAVER…', command=run_caver_dialog)
+    load_menu.add_command(label='Import CAVER output…', command=import_caver)
 
     # Compact icon buttons (folder = Load, floppy = Save) so the row fits beside the
     # Follow-YASARA checkbox on a single line; tooltips spell out what they do.
