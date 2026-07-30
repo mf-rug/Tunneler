@@ -713,7 +713,8 @@ def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_
 # ============================================================
 
 def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball_protein=2.8,
-             surf_con_prev=2.7, keep_surf_points=False, mds=0, min_vol=5, connect_cut=1, build_pol=True, prog='vis', progress_var=None,percent_label=None):
+             surf_con_prev=2.7, keep_surf_points=False, mds=0, min_vol=5, connect_cut=1, build_pol=True, prog='vis', progress_var=None,percent_label=None,
+             refined_surf_spacing=REFINED_SURF_SPACING):
     """Run the full tunnel detection pipeline on a YASARA protein object.
 
     This is the main entry point called by the GUI. It orchestrates the entire
@@ -931,7 +932,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
     # the initial coarse roughsurf with a smoother version used for visualization.
     tpoints = PosAtom(f'obj {target} with distance < {NEARBY_RESIDUE_DISTANCE} from accessible surface of obj {target}roughsurf', coordsys='global')
     tpoints_hull_vertices, hull_simplices = get_hull(tpoints)
-    tpoints_cube_points = get_cube_points(tpoints_hull_vertices, REFINED_SURF_SPACING)
+    tpoints_cube_points = get_cube_points(tpoints_hull_vertices, refined_surf_spacing)
     tpoints_shape_points = get_shape_points(tpoints_cube_points, tpoints_hull_vertices)
     tpoints_outside_points = load_cif_points(tpoints_shape_points, PWD() + os.path.sep + f'{target}tpoints_shape_points.cif', correct=True, center=False, progress_cb=_band(90, 98))[0]
     MoveObj(tpoints_outside_points,z=OBJECT_Z_OFFSET)
