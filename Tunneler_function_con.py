@@ -901,8 +901,20 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
     DelObj("Du")
     SwitchObj(f'{target}Cl???????? {target}excluded {target}Close2Surf {target}Close2Prot', 'OFF')
     SwitchObj(ListObj(f'{target}Cl???????')[:5], "ON")
-    HideMessage()
+    # Let the "Finished clustering in Xs" message linger long enough to read before we
+    # move on. w()'s own Wait(1) is just a flicker and Wait(10) was still too quick to
+    # read (confirmed via a Wait('Continuebutton') debug) -> Wait(100) here. vis mode
+    # only (silent in 'fast'/'wait').
+    if prog == 'vis':
+        Wait(100)
+    # The clusters are done, but the (dominant) ~0.6A display-surface rebuild still runs
+    # below. Switch the hull off FIRST, then announce the real status via w() -- w() does
+    # ShowMessage + Wait(1), and it's the Wait(1) that actually repaints (a bare
+    # ShowMessage from this worker thread with the console off never redraws). w() also
+    # respects the prog mode; the '|   ' console spacer matches the other messages. The
+    # message persists through the surface build and is cleared at the true end.
     SwitchObj(f'{str(target)}TPolygon?', 'off')
+    w('|   Finishing up: building surface...')
 
     # --- Refine the rough surface representation ---
     # Build a finer point cloud (0.6 A spacing) near the protein surface, then
@@ -936,6 +948,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
     HideObj(f'{target}roughsurf')
     SwitchObj(f'{target}roughsurf', 'off')
     SwitchObj('cutplane','off')
+    HideMessage()   # display surface built -> clear the "finishing up" status; final handover
 
     # transfer and fix ss in 'A' objs
     transf_and_fix_ss(target)
