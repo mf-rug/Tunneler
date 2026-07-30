@@ -148,6 +148,51 @@ def _ycolor(cv):
         return str(cv)
     return int(cv)
 
+
+import colorsys
+
+# YASARA named hues -> hue value (None = grey/white). Used by hue_to_rgb.
+color_names = {
+    "blue": 0,
+    "magenta": 60,
+    "red": 120,
+    "yellow": 180,
+    "green": 240,
+    "cyan": 300,
+    "gray": None,
+}
+
+
+def get_contrasting_text_color(hex_color):
+    """Return black or white hex color for readable text on the given background."""
+    r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+    luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+    return '#000000' if luminance > 0.5 else '#FFFFFF'
+
+
+def hue_to_rgb(hue, grey='w'):
+    """Convert a YASARA hue value (0-360+) to a hex RGB color string (#rrggbb).
+
+    Raises ValueError on an unparseable hue string. (Callers pass palette numbers
+    or YASARA colour values, so this never fires in practice -- but raising keeps
+    the converter pure/testable instead of hard-exiting the whole plugin.)"""
+    if isinstance(hue, str):
+        hue_lower = hue.lower()
+        if hue_lower in color_names:
+            hue = color_names[hue_lower]
+            if hue is None:  # Special handling for grey
+                return "#FFFFFF"  # white
+        else:
+            try:
+                hue = float(hue)
+            except ValueError:
+                raise ValueError(f'hue_to_rgb: unparseable hue {hue!r}')
+
+    adjusted_hue = (int(hue) + 240) % 360
+    r, g, b = colorsys.hsv_to_rgb(adjusted_hue / 360, 1, 1)
+    return "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
+
+
 # Verify the scientific stack is present AND functional before importing it.
 # ensure_dependencies() diagnoses the running Python (rejects YASARA's bundled
 # 'epy'), functionally probes each dependency (a bare `import matplotlib` misses
@@ -2662,46 +2707,8 @@ def tunneler_dialog():
     checkbutton6.configure(text='H\u2082O', variable=h2o_chk, command=H2O)
     checkbutton6.place(anchor="nw", x=136, y=16)
 
-    # --- Color utilities (YASARA hue ↔ RGB conversion) ---
-    import colorsys
-    color_names = {
-        "blue": 0,
-        "magenta": 60,
-        "red": 120,
-        "yellow": 180,
-        "green": 240,
-        "cyan": 300,
-        "gray": None,
-    }
-
-    def get_contrasting_text_color(hex_color):
-        """Return black or white hex color for readable text on the given background."""
-        Console("OFF")
-        r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
-        luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
-        return '#000000' if luminance > 0.5 else '#FFFFFF'
-    
-    def hue_to_rgb(hue, grey='w'):
-        """Convert a YASARA hue value (0-360+) to a hex RGB color string (#rrggbb)."""
-        if isinstance(hue, str):
-            hue_lower = hue.lower()
-            if hue_lower in color_names:
-                hue = color_names[hue_lower]
-                if hue is None:  # Special handling for grey
-                    return "#FFFFFF"  # white
-            else:
-                try:
-                    # Attempt to convert string to a number
-                    hue = float(hue)
-                except ValueError:
-                    ShowMessage(f'this is a bug, tried to use this hue: {hue}')
-                    wc()
-                    plugin.end()
- 
-        adjusted_hue = (int(hue) + 240) % 360
-        r, g, b = colorsys.hsv_to_rgb(adjusted_hue / 360, 1, 1)
-        hex_color = "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
-        return hex_color
+    # Colour converters (get_contrasting_text_color / hue_to_rgb / color_names)
+    # are module-level now -- see near _ycolor at the top of this file.
 
     def _palette_rgb(name, u):
         """'#rrggbb' for the strip preview at fraction u. 'hue' palettes match the rendered
