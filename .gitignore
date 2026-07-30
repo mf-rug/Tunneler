@@ -12,6 +12,8 @@ state*.png
 *.pyc
 dev/
 TUNNELER_FIXES.md
+# general-purpose personal notes, not project-specific
+tkinter_yasara_lessons.md
 
 # crash artifacts / downloaded structures / old DuplicateAtom temp files
 errorexit.*

@@ -3806,7 +3806,22 @@ def tunneler_dialog():
                 for label, cluster_points in clusters.items():
                     area, merged_shape = calculate_area_of_points(cluster_points, ball_spacing * 2, radius=0.75)
                     # print(f'cluster {label} has area {area}')
-                    x, y = merged_shape.exterior.xy
+                    # A disconnected cross-section is a MultiPolygon, which has no
+                    # .exterior -- iterate its lobes so the plot doesn't crash (each
+                    # lobe is its own closed outline). A single Polygon yields exactly
+                    # one outline, so the single-lobe behaviour is unchanged.
+                    polys = list(merged_shape.geoms) if merged_shape.geom_type.startswith('Multi') else [merged_shape]
+                    outlines = []
+                    for poly in polys:
+                        if poly.is_empty:
+                            continue
+                        px, py = poly.exterior.xy
+                        outlines.append((list(px), list(py)))
+                        # Update the bounds across every lobe of every cluster
+                        all_data_x_min = min(all_data_x_min, min(px))
+                        all_data_x_max = max(all_data_x_max, max(px))
+                        all_data_y_min = min(all_data_y_min, min(py))
+                        all_data_y_max = max(all_data_y_max, max(py))
                     if not only_area:
                         try:
                             max_circle_center, max_circle_radius = find_maximum_inscribed_circle(merged_shape)
@@ -3820,14 +3835,9 @@ def tunneler_dialog():
                         except AttributeError:
                             continue
                     total_area += area
-                    cluster_shapes[label] = (x, y, area)
+                    cluster_shapes[label] = (outlines, area)
                     if xsec_build:
                         xsec_shapes.append(merged_shape)
-                    # Update the bounds for all clusters
-                    all_data_x_min = min(all_data_x_min, min(x))
-                    all_data_x_max = max(all_data_x_max, max(x))
-                    all_data_y_min = min(all_data_y_min, min(y))
-                    all_data_y_max = max(all_data_y_max, max(y))
 
                 # Build the 3D cross-section overlay (filled + outline) on the plane.
                 if xsec_build:
@@ -3854,17 +3864,18 @@ def tunneler_dialog():
                     ax.set_ylim([all_data_y_min, all_data_y_max])
 
                 # Plot the clusters now with the updated axis limits
-                for label, (x, y, area) in cluster_shapes.items():
-                    ax.fill(x, y, color='black', label=f'Cluster {label}')
-                    ax.plot(x, y, color='cyan', linewidth=0.75, label=f'Cluster {label}')
+                for label, (outlines, area) in cluster_shapes.items():
+                    for x, y in outlines:
+                        ax.fill(x, y, color='black', label=f'Cluster {label}')
+                        ax.plot(x, y, color='cyan', linewidth=0.75, label=f'Cluster {label}')
                     # Add labels only in the separate window
-                    if not on_canvas:
-                        # Calculate the centroid of the cluster
-                        centroid_x = sum(x) / len(x)
-                        centroid_y = sum(y) / len(y)
-
+                    if not on_canvas and outlines:
+                        # Centroid over all lobe outline points of this cluster
+                        allx = [xi for xs, _ in outlines for xi in xs]
+                        ally = [yi for _, ys in outlines for yi in ys]
                         # Place the text annotation near the centroid
-                        ax.text(centroid_x, centroid_y, f"{area:.2f} \u212B\u00b2", 
+                        ax.text(sum(allx) / len(allx), sum(ally) / len(ally),
+                                f"{area:.2f} \u212B\u00b2",
                                 ha='center', va='center', color='red', fontsize=8.5, fontweight='bold')
 
 
