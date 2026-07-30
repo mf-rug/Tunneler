@@ -797,6 +797,21 @@ def _dup_hidden_obj(src, newname):
     return new
 
 
+PERF_ATOM_BASE = 30000   # protein-atom count above which a mid (8-core/16GB) machine defaults
+                         # to Performant mode; scaled by _machine_factor(). Heuristic, tunable.
+
+def _machine_factor():
+    """Coarse machine-capacity multiplier for the Performant-mode auto-recommendation: a
+    stronger machine gets a HIGHER atom threshold before it flips to Performant. Clamped to
+    [0.5, 2.0]. Zero-dependency; RAM via sysconf (mac/Linux), mid-range fallback elsewhere."""
+    cores = os.cpu_count() or 4
+    try:
+        ram_gb = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1024**3
+    except (ValueError, AttributeError, OSError):
+        ram_gb = 16.0
+    return max(0.5, min(2.0, min(cores / 8, ram_gb / 16)))
+
+
 def tunneler_dialog():
     """Build and run the 3-tab Tunneler tkinter dialog.
 
@@ -1785,7 +1800,7 @@ def tunneler_dialog():
         # `global` must cover BOTH branches: the else-branch previously assigned
         # module-local names that vanished, leaving the globals unset (NameError
         # on a fresh install with no config yet).
-        global ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog, performant_mode
+        global ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog, performant_mode, performant_mode_configured
         if os.path.exists(config_file):
             config = ConfigParser()
             config.read(config_file)
@@ -1804,8 +1819,11 @@ def tunneler_dialog():
             prog = str(v['prog'])
             # fallback keeps older config files (written before the Performant-mode toggle) valid
             performant_mode = config.getboolean('Variables', 'performant_mode', fallback=False)
+            # Whether the mode was ever saved: if not, the auto-recommendation sets a default.
+            performant_mode_configured = config.has_option('Variables', 'performant_mode')
         else:
             ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog, performant_mode = 3.8, 0.33, 2.8, 2.7, False, 0, 5, 1, True, 'vis', False
+            performant_mode_configured = False
     
     get_config()
     style = ttk.Style()
@@ -2114,10 +2132,43 @@ def tunneler_dialog():
             ball_spacing_scale_chk.set(round(min(max(v, lo), hi), 2))
             update_label(ball_spacing_scale_chk, ball_spacing_value_label, 2)
 
+    def _recommend_performant():
+        """True if Performant mode is advisable for the current target: predicted scene
+        heaviness (protein atom count) above a machine-scaled threshold. Size dominates --
+        it drives both detection cost and, the bigger worry, post-prediction render lag;
+        _machine_factor() only nudges the bar."""
+        tar = target()
+        if tar is None:
+            return False
+        atoms = CountAtom(f'obj {tar} and protein') or CountAtom(f'obj {tar}')
+        return atoms > PERF_ATOM_BASE * _machine_factor()
+
+    def _auto_set_performant(reason):
+        """Set the compute mode from _recommend_performant(), move the ball-spacing slider
+        to the new mode's default, and announce it (non-silent). Called ONLY when there is
+        no saved preference (fresh install) or on Reset -- a stored choice is respected."""
+        rec = _recommend_performant()
+        performant_mode_var.set(rec)
+        _apply_ball_range()
+        ball_spacing_scale_chk.set(_ball_range()[2])
+        update_label(ball_spacing_scale_chk, ball_spacing_value_label, 2)
+        mode = 'Performant' if rec else 'Quality'
+        # Announce via after() so the message renders in the event loop -- ShowMessage from
+        # dialog construction (the fresh-install path) would otherwise not repaint.
+        def _announce():
+            Console('OFF')
+            ShowMessage(f'{mode} mode auto-selected ({reason}) -- toggle the checkbox to override.')
+            Wait(30)
+            HideMessage()
+            Console('hidden')
+        root.after(300, _announce)
+
     performant_mode_chk = ttk.Checkbutton(tab1_mktun, text='Performant mode', variable=performant_mode_var,
                                     command=_apply_ball_range)
     performant_mode_chk.place(anchor="nw", x=200, y=310)
     _apply_ball_range()   # normalise the slider range/value to the loaded mode
+    if not performant_mode_configured:
+        _auto_set_performant('no saved preference')   # fresh install -> recommend a default
 
     run_tun_button = ttk.Button(tab1_mktun)
     run_tun_button.configure(style='Toolbutton', text='    Find tunnels    ', command=run_tun)
@@ -2125,10 +2176,9 @@ def tunneler_dialog():
 
     def reset():
         Console("OFF")
-        # Reset preserves the current compute mode; only the ball-spacing default is
-        # mode-aware (0.2 Performant / 0.3 Quality, via _ball_range()).
+        # Reset re-runs the machine/size auto-recommendation for the compute mode (which then
+        # sets the mode-aware ball-spacing default, 0.2 Performant / 0.3 Quality).
         ign_surf_scale_chk.set(3.8),
-        ball_spacing_scale_chk.set(_ball_range()[2]),
         prot_space_scale_chk.set(2.8),
         surf_con_scale_chk.set(2.7),
         num_md_scale_chk.set(0),
@@ -2137,12 +2187,12 @@ def tunneler_dialog():
         polygon_chk.set(True),
         show_prog_var.set('vis')
         update_label(ign_surf_scale_chk, ign_surf_value_label, 1)
-        update_label(ball_spacing_scale_chk, ball_spacing_value_label, 2)
         update_label(prot_space_scale_chk, prot_space_value_label, 2)
         update_label(surf_con_scale_chk, surf_con_value_label, 1)
         update_label(num_md_scale_chk, num_md_value_label, 0)
         update_label(min_vol_scale_chk, min_vol_value_label, 0)
         on_scale_change(connect_cut_scale_chk, connect_cut_scale, reset=True)
+        _auto_set_performant('reset to default')   # sets mode + ball-spacing default
 
     reset_button = ttk.Button(tab1_mktun)
     reset_button.configure(text = 'Reset to default', command=reset)
