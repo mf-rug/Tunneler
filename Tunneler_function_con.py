@@ -714,7 +714,7 @@ def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_
 
 def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball_protein=2.8,
              surf_con_prev=2.7, keep_surf_points=False, mds=0, min_vol=5, connect_cut=1, build_pol=True, prog='vis', progress_var=None,percent_label=None,
-             refined_surf_spacing=REFINED_SURF_SPACING):
+             refined_surf_spacing=REFINED_SURF_SPACING, performant_mode=False):
     """Run the full tunnel detection pipeline on a YASARA protein object.
 
     This is the main entry point called by the GUI. It orchestrates the entire
@@ -740,6 +740,10 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
         prog: Progress display mode ('vis', 'fast', or 'wait').
         progress_var: Optional tkinter IntVar for progress bar updates.
         percent_label: Optional tkinter Label for percentage display.
+        refined_surf_spacing: Grid spacing (A) for the refined display surface (roughsurf).
+            Display-only; does not affect the detected tunnels.
+        performant_mode: GUI compute-mode flag. Not used by detection itself; saved to the
+            config so the Performant/Quality checkbox round-trips.
     """
     # Publish the chosen progress mode to the module global that w() reads.
     # (Can't use `global prog` here: `prog` is also a parameter name, so we set
@@ -764,7 +768,8 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
         'min_vol':min_vol,
         'connect_cut':connect_cut,
         'build_pol':build_pol,
-        'prog':prog
+        'prog':prog,
+        'performant_mode':performant_mode
     }
     config = ConfigParser()
 

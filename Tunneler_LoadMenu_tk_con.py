@@ -1075,7 +1075,7 @@ def tunneler_dialog():
 
     def _set_perf(on):
         """Apply (on=True) / remove (on=False) non-destructive performance mode for the
-        current scene. This is auto-driven by the Fast-mode checkbox on Tab 1 (there is no
+        current scene. This is auto-driven by the Performant-mode checkbox on Tab 1 (there is no
         longer a manual button). ON = opaque tunnels render as their surface shell only
         (sphere meshes rebuild shell-only; points/balls hide interior atoms) and stashed
         inactive-mode meshes are freed; the '...Cl...' cloud is untouched, so A* /
@@ -1785,7 +1785,7 @@ def tunneler_dialog():
         # `global` must cover BOTH branches: the else-branch previously assigned
         # module-local names that vanished, leaving the globals unset (NameError
         # on a fresh install with no config yet).
-        global ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog, fast_mode
+        global ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog, performant_mode
         if os.path.exists(config_file):
             config = ConfigParser()
             config.read(config_file)
@@ -1802,10 +1802,10 @@ def tunneler_dialog():
             connect_cut = int(v['connect_cut'])
             build_pol = config.getboolean('Variables', 'build_pol')
             prog = str(v['prog'])
-            # fallback keeps older config files (written before the Fast-mode toggle) valid
-            fast_mode = config.getboolean('Variables', 'fast_mode', fallback=False)
+            # fallback keeps older config files (written before the Performant-mode toggle) valid
+            performant_mode = config.getboolean('Variables', 'performant_mode', fallback=False)
         else:
-            ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog, fast_mode = 3.8, 0.33, 2.8, 2.7, False, 0, 5, 1, True, 'vis', False
+            ignore_surface, ball_spacing, max_ball_protein, surf_con_prev, keep_surf_points, mds, min_vol, connect_cut, build_pol, prog, performant_mode = 3.8, 0.33, 2.8, 2.7, False, 0, 5, 1, True, 'vis', False
     
     get_config()
     style = ttk.Style()
@@ -2056,7 +2056,8 @@ def tunneler_dialog():
                  prog=show_prog_var.get(),
                  progress_var=progress_var,
                  percent_label=percent_label,
-                 refined_surf_spacing=(1.0 if fast_mode_var.get() else 0.8))
+                 refined_surf_spacing=(1.0 if performant_mode_var.get() else 0.8),
+                 performant_mode=performant_mode_var.get())
         progress_window.destroy()
 
         if target():
@@ -2070,9 +2071,9 @@ def tunneler_dialog():
             # Precompute surface-point distances now (cheap KDTree) so the
             # Surface-points slider in the Appearance tab is instant from the first drag.
             _precompute_surf_dist(target())
-            # Fast mode: auto-apply the render performance cull (what the old
+            # Performant mode: auto-apply the render performance cull (what the old
             # "Improve performance" button did), so lightened rendering is on by default.
-            if fast_mode_var.get():
+            if performant_mode_var.get():
                 _set_perf(True)
         initializing = False
         Wait(1)
@@ -2089,17 +2090,19 @@ def tunneler_dialog():
         show_progress_tunneler()
 
 
-    # --- Compute mode (Fast vs Quality) --------------------------------------
-    # One checkbox that trades resolution for speed. Fast mode: shifts the ball-spacing
-    # slider range UP (coarser detection grid), coarsens the refined display surface, and
-    # auto-applies the render performance cull after detection. Quality (default, unchecked)
-    # keeps the original fine behaviour. Consumed in show_progress_tunneler (surf spacing +
-    # _set_perf). The mode's default comes from the ini (fast_mode); it does not auto-save.
-    fast_mode_var = tk.BooleanVar(value=fast_mode)
+    # --- Compute mode (Performant vs Quality) --------------------------------
+    # One checkbox that trades resolution for interaction speed. Performant mode: shifts the
+    # ball-spacing slider range UP (coarser detection grid allowed), coarsens the refined
+    # display surface, and auto-applies the render performance cull after detection. Quality
+    # (default, unchecked) keeps the original fine behaviour. Consumed in
+    # show_progress_tunneler (surf spacing + _set_perf) and persisted via Tunneler's config
+    # write (the ini 'performant_mode' key round-trips through get_config).
+    performant_mode_var = tk.BooleanVar(value=performant_mode)
 
     def _ball_range():
-        """(min, max, reset-default) for the ball-spacing slider in the current mode."""
-        return (0.2, 1.0, 0.5) if fast_mode_var.get() else (0.12, 0.5, 0.33)
+        """(min, max, reset-default) for the ball-spacing slider in the current mode.
+        Reset-default: 0.2 in Performant mode, 0.3 in Quality mode."""
+        return (0.2, 1.0, 0.2) if performant_mode_var.get() else (0.12, 0.5, 0.3)
 
     def _apply_ball_range(*args):
         """Reconfigure the ball-spacing slider for the current mode, clamping the current
@@ -2111,9 +2114,9 @@ def tunneler_dialog():
             ball_spacing_scale_chk.set(round(min(max(v, lo), hi), 2))
             update_label(ball_spacing_scale_chk, ball_spacing_value_label, 2)
 
-    fast_mode_chk = ttk.Checkbutton(tab1_mktun, text='Fast mode', variable=fast_mode_var,
+    performant_mode_chk = ttk.Checkbutton(tab1_mktun, text='Performant mode', variable=performant_mode_var,
                                     command=_apply_ball_range)
-    fast_mode_chk.place(anchor="nw", x=200, y=310)
+    performant_mode_chk.place(anchor="nw", x=200, y=310)
     _apply_ball_range()   # normalise the slider range/value to the loaded mode
 
     run_tun_button = ttk.Button(tab1_mktun)
@@ -2122,16 +2125,17 @@ def tunneler_dialog():
 
     def reset():
         Console("OFF")
-        ign_surf_scale_chk.set(3.8), 
-        ball_spacing_scale_chk.set(0.33),
-        prot_space_scale_chk.set(2.8), 
-        surf_con_scale_chk.set(2.7), 
-        num_md_scale_chk.set(0), 
+        # Reset preserves the current compute mode; only the ball-spacing default is
+        # mode-aware (0.2 Performant / 0.3 Quality, via _ball_range()).
+        ign_surf_scale_chk.set(3.8),
+        ball_spacing_scale_chk.set(_ball_range()[2]),
+        prot_space_scale_chk.set(2.8),
+        surf_con_scale_chk.set(2.7),
+        num_md_scale_chk.set(0),
         min_vol_scale_chk.set(5),
         connect_cut_scale_chk.set(1),
         polygon_chk.set(True),
         show_prog_var.set('vis')
-        fast_mode_var.set(False)          # default = Quality mode
         update_label(ign_surf_scale_chk, ign_surf_value_label, 1)
         update_label(ball_spacing_scale_chk, ball_spacing_value_label, 2)
         update_label(prot_space_scale_chk, prot_space_value_label, 2)
@@ -2139,7 +2143,6 @@ def tunneler_dialog():
         update_label(num_md_scale_chk, num_md_value_label, 0)
         update_label(min_vol_scale_chk, min_vol_value_label, 0)
         on_scale_change(connect_cut_scale_chk, connect_cut_scale, reset=True)
-        _apply_ball_range()               # restore the Quality-mode slider range
 
     reset_button = ttk.Button(tab1_mktun)
     reset_button.configure(text = 'Reset to default', command=reset)
@@ -2151,7 +2154,7 @@ def tunneler_dialog():
     #  Color by (tunnel / distance), Actions (recluster),
     #  Surface points slider
     #  Callbacks: Tunnelonoff, Targetonoff, Balls, Points, Spheres,
-    #    Shapes, Colorbytunnel, Colorbytunneldist, _set_perf (Fast mode),
+    #    Shapes, Colorbytunnel, Colorbytunneldist, _set_perf (Performant mode),
     #    Recluster, ml_outside_points, SecStr, Surf, on_cut
     # --------------------------------------------------------
     tab2_appear = ttk.Frame(notebook)
@@ -3121,8 +3124,8 @@ def tunneler_dialog():
     separator9.configure(orient="horizontal")
     separator9.place(anchor="nw", height=2, width=255, x=45, y=274)
 
-    # (The old "Improve performance" button lived here. It's now folded into the Fast-mode
-    # checkbox on Tab 1, which auto-applies the same cull after a Fast-mode detection.)
+    # (The old "Improve performance" button lived here. It's now folded into the Performant-mode
+    # checkbox on Tab 1, which auto-applies the same cull after a Performant-mode detection.)
 
 
     def create_tooltip(widget, text, delay=775):
@@ -3169,12 +3172,12 @@ def tunneler_dialog():
         widget.bind('<Leave>', hide_tooltip)
 
 
-    create_tooltip(fast_mode_chk, "Fast mode: trades resolution for speed. Coarser detection grid\n"
-                                  "(the Ball-spacing slider shifts to a larger range), a coarser\n"
-                                  "display surface, and the render performance cull is auto-applied\n"
-                                  "after detection (opaque tunnels draw as their surface shell only;\n"
-                                  "the tunnel data stays exact -- pathfinding/cross-section/volume\n"
-                                  "are unaffected). Unchecked = full quality (the default).")
+    create_tooltip(performant_mode_chk, "Performant mode: trades resolution for interaction speed. Coarser\n"
+                                  "detection grid allowed (the Ball-spacing slider shifts to a larger\n"
+                                  "range), a coarser display surface, and the render performance cull is\n"
+                                  "auto-applied after detection (opaque tunnels draw as their surface\n"
+                                  "shell only; the tunnel data stays exact -- pathfinding/cross-section/\n"
+                                  "volume are unaffected). Unchecked = full quality (the default).")
 
     # --- Tab-1 input-setting tooltips ---------------------------------------
     create_tooltip(ign_surf_scale,
