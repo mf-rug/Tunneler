@@ -1351,17 +1351,6 @@ def tunneler_dialog():
         if folder:
             _import_caver_from(folder, offer_align=True)
 
-    def _protein_centroid(obj):
-        """Geometric centre of a loaded object's protein atoms (global coords), the default
-        CAVER start point when the user hasn't picked one."""
-        Console("OFF")
-        pos = PosAtom(f'Obj {obj} and protein', coordsys='global') or PosAtom(f'Obj {obj}', coordsys='global')
-        Console("hidden")
-        k = len(pos) // 3
-        if k == 0:
-            return (0.0, 0.0, 0.0)
-        return (sum(pos[0::3]) / k, sum(pos[1::3]) / k, sum(pos[2::3]) / k)
-
     def _download_caver_with_progress():
         """Download+extract CAVER on the main thread with a progress bar (one-time setup).
         Returns the caver home dir, or None on failure."""
@@ -1468,7 +1457,7 @@ def tunneler_dialog():
 
         # Starting point -------------------------------------------------------
         ttk.Label(win, text='Starting point').grid(row=1, column=0, sticky='w', **pad)
-        start_lbl = ttk.Label(win, text='(protein centre)', foreground='#555')
+        start_lbl = ttk.Label(win, text='(mark an atom in the cavity)', foreground='#555')
         start_lbl.grid(row=1, column=1, sticky='w', **pad)
         start_point = {'xyz': None}
 
@@ -1514,14 +1503,25 @@ def tunneler_dialog():
             except ValueError:
                 _caver_msg('Parameters must be numbers.')
                 return
-            xyz = start_point['xyz'] or _protein_centroid(prot_obj)
+            xyz = start_point['xyz']
+            if xyz is None:
+                _caver_msg('Mark an atom in YASARA near the cavity of interest (click it, white '
+                           'firefly), then press "Use marked atom". CAVER needs a start point '
+                           'inside a buried cavity -- the protein centre does not work.')
+                return
             run_dir = tempfile.mkdtemp(prefix='tunneler_caver_')
             in_dir = os.path.join(run_dir, 'input')
             os.makedirs(in_dir)
             out_dir = os.path.join(run_dir, 'out')
             Console("OFF")
-            # Water fills cavities and blocks tunnels -> exclude it from CAVER's input atoms.
-            SavePDB(f'Obj {prot_obj} Res !HOH', os.path.join(in_dir, 'structure.pdb'))
+            # Water fills cavities and blocks tunnels, so it must be excluded from CAVER's
+            # input. SavePDB writes whole OBJECTS (atom-subselections like 'Res !HOH' are
+            # ignored), so duplicate the structure, delete water from the copy, save that,
+            # and discard the copy. Non-water ligands/cofactors are kept (obstacles).
+            dup = DuplicateObj(prot_obj)[0]
+            DelRes(f'Obj {dup} Res HOH')
+            SavePDB(f'Obj {dup}', os.path.join(in_dir, 'structure.pdb'))
+            DelObj(dup)
             Console("hidden")
             cfg_path = os.path.join(run_dir, 'config.txt')
             with open(cfg_path, 'w') as f:
