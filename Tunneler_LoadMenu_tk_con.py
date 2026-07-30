@@ -1241,28 +1241,6 @@ def tunneler_dialog():
         win.wait_window()
         return result['obj']
 
-    def _show_caver_spheres(sel):
-        """Render each pseudo-atom in `sel` as a sphere sized by its B-factor (= CAVER tunnel
-        radius) and coloured by the atom's colour, joined into one 'caver_sphere' object."""
-        Console("OFF")
-        atomnums = ListAtom(sel)
-        if not atomnums:
-            Console("hidden"); return
-        cols = ColorAtom(sel)
-        rads = BFactorAtom(sel)
-        pos = PosAtom(sel, coordsys='global')          # flat [x1,y1,z1, x2,y2,z2, ...]
-        for i in range(len(atomnums)):
-            obj = ShowSphere(radius=rads[i], color=cols[i], alpha=100, level=2)
-            PosObj(obj, pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2])
-        # ShowSphere names its objects 'Sphere'; the plugin's own meshes are 'NNN_Sphere',
-        # so this selection never catches them.
-        spheres = ListObj('Sphere')
-        if spheres:
-            jobj = spheres[0]
-            JoinObj('Sphere', jobj)
-            NameObj(jobj, 'caver_sphere')
-        Console("hidden")
-
     def _import_caver_from(folder, offer_align=True, frame_obj=None):
         """Import CAVER output under `folder` as a rainbow 'beads on a string' overlay:
         locate .../clusters_timeless/*.pdb (per-cluster pseudo-atom strings, B-factor =
@@ -1360,9 +1338,11 @@ def tunneler_dialog():
                     Console("hidden")
 
         Console("OFF")
-        HideObj(prot)
-        _show_caver_spheres(f'Obj {prot} Mol {" ".join(mols)}')
+        HideObj(prot)      # the 'caver' molecules are just the data source now
         Console("hidden")
+        # Draw the visible overlay via the Caver tab's settings and reveal that tab.
+        _reveal_caver_tab()
+        _redraw_caver()
         return True
 
     def import_caver():
@@ -1457,7 +1437,7 @@ def tunneler_dialog():
         selection (or the protein centroid); a handful of key params; runs headless."""
         m = re.findall(r"\d+(?=:)", target_option.get())
         if not m:
-            _caver_msg("Pick a structure in the 'Create Tunnels' tab first.")
+            _caver_msg("Pick a structure in the 'Predict' tab first.")
             return
         prot_obj = m[0]
 
@@ -2652,7 +2632,7 @@ def tunneler_dialog():
     # --------------------------------------------------------
     tab1_mktun = ttk.Frame(notebook)
     tab1_mktun.configure(height=375, width=310)  # Set dimensions as needed
-    notebook.add(tab1_mktun, text='Create Tunnels', padding=0)  # Add tab1_mktun as the second tab
+    notebook.add(tab1_mktun, text='Predict', padding=0)  # tab 0
 
     def update_label(var, label, n=1):
         """Update the label with the value of the variable."""
@@ -2890,7 +2870,7 @@ def tunneler_dialog():
 
         if target():
             notebook.add(tab2_appear, text = 'Appearance')
-            notebook.add(tab3_inspect, text = 'Inspect Tunnel')
+            notebook.add(tab3_inspect, text = 'Inspect')
             notebook.select(tab2_appear)
             tnl_insp_options_list = ['All']
             for x in ListObj(f'{target()}Cl???????', format='OBJNUM: OBJNAME'):
@@ -4265,7 +4245,7 @@ def tunneler_dialog():
     # --------------------------------------------------------
     tab3_inspect = ttk.Frame(notebook)
     tab3_inspect.configure(height=375, width=310)  # Set dimensions as needed
-    notebook.add(tab3_inspect, text='Inspect Tunnel', padding=0)  # Add tab1_mktun as the second tab
+    notebook.add(tab3_inspect, text='Inspect', padding=0)  # tab 2
 
     tnl_insp_label = tk.Label(tab3_inspect, text=f"Select:")
     tnl_insp_label.place(anchor="nw", x=2, y=1)
@@ -5435,6 +5415,106 @@ def tunneler_dialog():
     diam_up.configure(text='>', style='Toolbutton', command=on_diam_up)
 
     # --------------------------------------------------------
+    #  TAB 4 — Caver (appearance of the imported CAVER overlay)
+    #    Widgets: palette / color-by / shape / alpha
+    #    Redraws the visible 'caver_sphere' from the hidden 'caver' data object.
+    # --------------------------------------------------------
+    tab4_caver = ttk.Frame(notebook)
+    tab4_caver.configure(height=375, width=310)
+    notebook.add(tab4_caver, text='Caver', padding=0)   # tab 3
+
+    caver_palette_var = tk.StringVar(value='Rainbow')
+    caver_colorby_var = tk.StringVar(value='Cluster')
+    caver_shape_var   = tk.StringVar(value='Spheres')
+    caver_alpha_var   = tk.IntVar(value=100)
+
+    def _reveal_caver_tab(select=True):
+        """Un-hide the Caver tab (hidden until a CAVER overlay exists), optionally show it."""
+        try:
+            notebook.tab(3, state='normal')
+            if select:
+                notebook.select(tab4_caver)
+        except Exception:
+            pass
+
+    def _redraw_caver(*_):
+        """Rebuild the visible 'caver_sphere' overlay from the hidden 'caver' data object,
+        honouring the tab's palette / color-by / shape / alpha. The data object keeps the
+        geometry (bead positions + per-bead B-factor radius) grouped into per-cluster molecules
+        tA/tB..., so the overlay can be re-rendered on demand without re-running CAVER."""
+        cav = ListObj('Obj caver')
+        if not cav:
+            return
+        cav = cav[0]
+        Console("OFF")
+        try:
+            DelObj('Obj caver_sphere')          # drop the previous render
+        except Exception:
+            pass
+        palette = caver_palette_var.get()
+        color_by = caver_colorby_var.get()
+        alpha = float(caver_alpha_var.get())
+        shape = caver_shape_var.get()
+
+        mols = ListMol(f'Obj {cav}', format='MOLNAME')   # ['tA','tB',...] one per cluster
+        bf_all = BFactorAtom(f'Obj {cav}')
+        lo, hi = (min(bf_all), max(bf_all)) if bf_all else (0.0, 1.0)
+        centers, radii, colors = [], [], []
+        n = len(mols)
+        for i, m in enumerate(mols):
+            pos = PosAtom(f'Obj {cav} Mol {m}', coordsys='global')   # global: matches the scene
+            bf = BFactorAtom(f'Obj {cav} Mol {m}')
+            clustcol = _palette_color(palette, i / max(n - 1, 1))
+            for j in range(len(bf)):
+                centers.append((pos[3 * j], pos[3 * j + 1], pos[3 * j + 2]))
+                radii.append(bf[j])
+                if color_by == 'Radius':
+                    u = (bf[j] - lo) / (hi - lo) if hi > lo else 0.5
+                    colors.append(_palette_color(palette, u))
+                else:
+                    colors.append(clustcol)
+        if not centers:
+            Console("hidden"); return
+
+        if shape == 'Surface':
+            # One merged smooth surface (marching-cubes union of balls). The builder takes a
+            # single radius, so use the median bead radius (uniform width); the Spheres mode
+            # still shows the true per-bead variation.
+            obj = _union_shape_mesh(centers, colors, float(np.median(radii)), alpha)
+            if obj is not None:
+                NameObj(obj, 'caver_sphere')
+        else:
+            for c, r, col in zip(centers, radii, colors):
+                o = ShowSphere(radius=r, color=col, alpha=alpha, level=2)
+                PosObj(o, c[0], c[1], c[2])
+            sph = ListObj('Sphere')             # ShowSphere names its meshes 'Sphere'
+            if sph:
+                JoinObj('Sphere', sph[0])
+                NameObj(sph[0], 'caver_sphere')
+        Console("hidden")
+
+    ttk.Label(tab4_caver, text='Appearance of the imported CAVER tunnels:',
+              font='TkSmallCaptionFont').grid(row=0, column=0, columnspan=2, sticky='w',
+                                              padx=10, pady=(10, 4))
+    ttk.Label(tab4_caver, text='Palette').grid(row=1, column=0, sticky='w', padx=10, pady=7)
+    ttk.OptionMenu(tab4_caver, caver_palette_var, caver_palette_var.get(),
+                   *DIST_PALETTES.keys(), command=_redraw_caver).grid(
+        row=1, column=1, sticky='w', padx=10, pady=7)
+    ttk.Label(tab4_caver, text='Color by').grid(row=2, column=0, sticky='w', padx=10, pady=7)
+    ttk.OptionMenu(tab4_caver, caver_colorby_var, caver_colorby_var.get(),
+                   'Cluster', 'Radius', command=_redraw_caver).grid(
+        row=2, column=1, sticky='w', padx=10, pady=7)
+    ttk.Label(tab4_caver, text='Shape').grid(row=3, column=0, sticky='w', padx=10, pady=7)
+    ttk.OptionMenu(tab4_caver, caver_shape_var, caver_shape_var.get(),
+                   'Spheres', 'Surface', command=_redraw_caver).grid(
+        row=3, column=1, sticky='w', padx=10, pady=7)
+    ttk.Label(tab4_caver, text='Alpha').grid(row=4, column=0, sticky='w', padx=10, pady=7)
+    caver_alpha_scale = ttk.Scale(tab4_caver, from_=5, to=100, orient='horizontal',
+                                  variable=caver_alpha_var, length=150)
+    caver_alpha_scale.grid(row=4, column=1, sticky='w', padx=10, pady=7)
+    caver_alpha_scale.bind('<ButtonRelease-1>', _redraw_caver)   # redraw on release, not each pixel
+
+    # --------------------------------------------------------
     #  DIALOG MAINLOOP
     # --------------------------------------------------------
 
@@ -5442,6 +5522,12 @@ def tunneler_dialog():
     if target() == None:
         notebook.tab(1, state='hidden')
         notebook.tab(2, state='hidden')
+    notebook.tab(3, state='hidden')          # Caver tab: revealed after a CAVER import
+    try:
+        if ListObj('Obj caver'):             # ...unless a loaded scene already has an overlay
+            _reveal_caver_tab(select=False)
+    except Exception:
+        pass
 
     Console("hidden")
     initializing = False
