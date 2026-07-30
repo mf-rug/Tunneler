@@ -755,6 +755,14 @@ def tunneler_dialog():
     """
     Console("OFF")
 
+    # Single owner for the re-entrancy guard. Declaring it global here makes the
+    # `initializing = True/False` assignments in this body (construction bracket) AND
+    # in show_progress_tunneler (recompute bracket) write the SAME module global, so
+    # the Tab-3 callbacks that read `initializing` are suppressed in both windows.
+    # Without this, the body's assignments were dialog-locals invisible to those
+    # callbacks, leaving the recompute guard effectively dead (A7).
+    global initializing
+
     # --------------------------------------------------------
     #  STATE HELPERS — Determine current target, read config
     # --------------------------------------------------------
@@ -3325,10 +3333,7 @@ def tunneler_dialog():
     zoomsteps = 10
     def inspect_changed(*args):
         """Callback when the tunnel selector dropdown changes. Zooms to the selected tunnel."""
-        if 'initializing' in globals():
-            global initializing
-        elif 'initializing' not in locals():
-            initializing = False
+        global initializing
         if initializing:
             return
         Console("OFF")
