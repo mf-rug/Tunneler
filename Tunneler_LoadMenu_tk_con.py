@@ -215,6 +215,8 @@ from Tunneler_function_con import *
 import tkinter as tk
 import tkinter.ttk as ttk
 import tkinter.filedialog as filedialog
+import tkinter.messagebox as messagebox
+import time
 from Tunneler_diameter_functions import *
 from sklearn.cluster import DBSCAN
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -1145,7 +1147,9 @@ def tunneler_dialog():
         (PairObj, written every detection run) and are read back on Load."""
         tar = target()
         Console("OFF")
-        default = f'{NameObj(tar)[0]}_tunnels.sce' if tar is not None else 'tunnels.sce'
+        stamp = time.strftime('%Y-%m-%d_%H%M%S')
+        default = (f'{NameObj(tar)[0]}_tunnels_{stamp}.sce' if tar is not None
+                   else f'tunnels_{stamp}.sce')
         Console("hidden")
         path = filedialog.asksaveasfilename(
             parent=root, title='Save tunnel scene', initialfile=default,
@@ -1186,6 +1190,16 @@ def tunneler_dialog():
             filetypes=[('YASARA scene', '*.sce'), ('All files', '*')])
         Console("hidden")
         if not path:
+            return
+        # LoadSce clears the whole scene first -- warn before discarding anything loaded.
+        Console("OFF")
+        has_scene = ListObj('all') != []
+        Console("hidden")
+        if has_scene and not messagebox.askyesno(
+                'Replace current scene?',
+                'Loading a scene clears everything currently loaded and replaces it with '
+                'the saved scene. Any unsaved work will be lost.\n\nContinue?',
+                parent=root, icon='warning', default='no'):
             return
         Console("OFF")
         LoadSce(path)
@@ -3766,15 +3780,19 @@ def tunneler_dialog():
     load_menu.add_command(label='Tunneler scene…', command=load_tunneler_scene)
     load_menu.add_command(label='Import CAVER…', command=import_caver)
 
-    load_button = ttk.Button(root, text='Load', width=5, command=_post_load_menu)
-    load_button.place(anchor="nw", x=170, y=401)
+    # Compact icon buttons (folder = Load, floppy = Save) so the row fits beside the
+    # Follow-YASARA checkbox on a single line; tooltips spell out what they do.
+    load_button = ttk.Button(root, text='\U0001F4C2', width=2, command=_post_load_menu)
+    load_button.place(anchor="nw", x=121, y=401)
+    create_tooltip(load_button, 'Load a saved Tunneler scene, or import CAVER output')
 
-    save_button = ttk.Button(root, text='Save', width=5, command=save_scene)
-    save_button.place(anchor="nw", x=218, y=401)
+    save_button = ttk.Button(root, text='\U0001F4BE', width=2, command=save_scene)
+    save_button.place(anchor="nw", x=180, y=401)
+    create_tooltip(save_button, 'Save the current scene to a file')
 
     button4 = ttk.Button(root)
     button4.configure(text='Exit', command=on_cancel)
-    button4.place(anchor="nw", x=266, y=401)
+    button4.place(anchor="nw", x=239, y=401)
 
     separator7 = ttk.Separator(root)
     separator7.configure(orient="horizontal")
