@@ -1474,10 +1474,11 @@ def tunneler_dialog():
         win = tk.Toplevel(root)
         win.title('Run CAVER')
         win.attributes('-topmost', True)
-        pad = {'padx': 8, 'pady': 3}
+        win.resizable(False, False)
 
         ttk.Label(win, text=f'Structure:  {NameObj(prot_obj)[0]} (obj {prot_obj})',
-                  font='TkSmallCaptionFont').grid(row=0, column=0, columnspan=3, sticky='w', **pad)
+                  font='TkSmallCaptionFont').grid(row=0, column=0, columnspan=4, sticky='w',
+                                                  padx=5, pady=(5, 2))
 
         # start_point carries the picked start across the widgets and the run. Everything is
         # kept in view-independent LOCAL coords; 'global' is camera-relative and would go stale
@@ -1560,9 +1561,11 @@ def tunneler_dialog():
                 pass
 
         # Starting point -------------------------------------------------------
-        ttk.Label(win, text='Starting point').grid(row=1, column=0, sticky='w', **pad)
-        start_lbl = ttk.Label(win, text='(mark an atom, or use center of gravity)', foreground='#555')
-        start_lbl.grid(row=1, column=1, sticky='w', **pad)
+        # row 1: "Start point" + the two source buttons, all in one left-packed frame so the
+        # buttons hug the label and don't inherit the (wider) parameter column widths.
+        # row 2: one shared status line.
+        status_lbl = ttk.Label(win, text='mark an atom, or use center of gravity', foreground='#555')
+        status_lbl.grid(row=2, column=0, columnspan=4, sticky='w', padx=5, pady=(0, 2))
 
         def _render_start():
             """Draw the preview + set the labels for the ALREADY-captured pick, honouring the
@@ -1582,11 +1585,9 @@ def tunneler_dialog():
                     start_point['snap_local'] = snap_l
                     start_point['diag'] = s
                     _draw_preview(pick_l, snap_l, s)
-                    start_lbl.config(text='snapped into cavity', foreground='#1a7f1a')
-                    snap_lbl.config(
-                        text='pick clr %.1f Å / bur %.0f%%   →   snap clr %.1f Å / bur %.0f%%   '
-                             '(moved %.1f Å)' % (s['pick_clearance'], 100 * s['pick_burial'],
-                                                 s['clearance'], 100 * s['burial'], s['displacement']),
+                    status_lbl.config(
+                        text='snapped ✓   clr %.1f Å · bur %.0f%% · moved %.1f Å'
+                             % (s['clearance'], 100 * s['burial'], s['displacement']),
                         foreground='#1a7f1a')
                 else:
                     start_point.pop('snap_caver', None)
@@ -1594,12 +1595,10 @@ def tunneler_dialog():
                     clr = caver.point_clearance(pick_l, atoms)
                     bur = caver.point_burial(pick_l, atoms, caver._sphere_directions(32))
                     _draw_preview(pick_l, None, None)
-                    cx, cy, cz = start_point['raw_caver']
-                    start_lbl.config(text='%.2f, %.2f, %.2f  (raw click)' % (cx, cy, cz),
-                                     foreground='black')
-                    warn = '   ⚠ looks surface-exposed' if bur < 0.5 else ''
-                    snap_lbl.config(text='clearance %.1f Å / burial %.0f%%%s' % (clr, 100 * bur, warn),
-                                    foreground=('#b06000' if warn else '#555'))
+                    warn = '   ⚠ surface-exposed' if bur < 0.5 else ''
+                    status_lbl.config(
+                        text='raw click   clr %.1f Å · bur %.0f%%%s' % (clr, 100 * bur, warn),
+                        foreground=('#b06000' if warn else 'black'))
             finally:
                 Console("hidden")
 
@@ -1646,11 +1645,10 @@ def tunneler_dialog():
             _render_start()
 
         srcf = ttk.Frame(win)
-        srcf.grid(row=1, column=2, sticky='w', **pad)
-        ttk.Button(srcf, text='Marked atom', width=15, command=_capture_start).pack(
-            side=tk.TOP, anchor='w', pady=1)
-        ttk.Button(srcf, text='Center of gravity', width=15, command=_use_cog).pack(
-            side=tk.TOP, anchor='w', pady=1)
+        srcf.grid(row=1, column=0, columnspan=4, sticky='w', padx=5, pady=2)
+        ttk.Label(srcf, text='Start point').pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(srcf, text='Marked atom', command=_capture_start).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(srcf, text='Center of gravity', command=_use_cog).pack(side=tk.LEFT)
 
         # Auto-snap toggle + live clearance/burial readout ---------------------
         caver_snap_var = tk.BooleanVar(value=True)
@@ -1665,50 +1663,56 @@ def tunneler_dialog():
                      "optimization ('Start-point search') is applied instead.")
         snap_chk = ttk.Checkbutton(win, text='Auto-snap start into cavity',
                                    variable=caver_snap_var, command=_render_start)
-        snap_chk.grid(row=2, column=0, columnspan=2, sticky='w', **pad)
+        snap_chk.grid(row=3, column=0, columnspan=3, sticky='w', padx=5, pady=(4, 2))
         snap_tip = ttk.Label(win, text='ⓘ', foreground='#3a6ea5', cursor='question_arrow')
-        snap_tip.grid(row=2, column=2, sticky='w', **pad)
+        snap_tip.grid(row=3, column=3, sticky='w', padx=5, pady=(4, 2))
         create_tooltip(snap_tip, snap_help)
         create_tooltip(snap_chk, snap_help)
-        snap_lbl = ttk.Label(win, text='', foreground='#555')
-        snap_lbl.grid(row=3, column=0, columnspan=3, sticky='w', padx=8)
 
-        # Parameters -----------------------------------------------------------
-        params = [('Probe radius (Å)', 'probe', '0.9'),
-                  ('Shell radius (Å)', 'shell_r', '3'),
+        # Parameters ----------------------------------------------------------
+        # Four short params in two columns; the longer "Start search" gets its own left-packed
+        # row so its width can't push the second column right.
+        params = [('Probe (Å)', 'probe', '0.9'),
+                  ('Shell R (Å)', 'shell_r', '3'),
                   ('Shell depth', 'shell_d', '4'),
-                  ('Clustering threshold', 'clust', '3.5'),
-                  ('Start-point search (Å)', 'max_dist', '3')]
+                  ('Cluster thr', 'clust', '3.5')]
         param_base = 4  # first parameter row (rows 1-3 are the start-point block)
-        param_help = {
-            'max_dist': ("With Auto-snap ON: how far the plugin may move your click\n"
-                         "toward the roomiest nearby buried spot.\n"
-                         "With Auto-snap OFF: CAVER's own max_distance -- how far\n"
-                         "CAVER walks the start toward open space.\n"
-                         "Either way, raise it first if you get 0 tunnels; too large\n"
-                         "can drift into a neighbouring pocket."),
-        }
         pvars = {}
         for i, (label, key, default) in enumerate(params):
-            lbl = ttk.Label(win, text=label)
-            lbl.grid(row=param_base + i, column=0, sticky='w', **pad)
+            r, c = param_base + i // 2, (i % 2) * 2   # two params per row
+            ttk.Label(win, text=label).grid(row=r, column=c, sticky='w', padx=(5, 2), pady=2)
             v = tk.StringVar(value=default)
             pvars[key] = v
-            ttk.Entry(win, textvariable=v, width=8).grid(row=param_base + i, column=1, sticky='w', **pad)
-            if key in param_help:
-                tip = ttk.Label(win, text='ⓘ', foreground='#3a6ea5', cursor='question_arrow')
-                tip.grid(row=param_base + i, column=2, sticky='w', **pad)
-                create_tooltip(tip, param_help[key])
-                create_tooltip(lbl, param_help[key])
+            ttk.Entry(win, textvariable=v, width=6).grid(row=r, column=c + 1, sticky='w',
+                                                         padx=(0, 6), pady=2)
+
+        ms_row = param_base + (len(params) + 1) // 2
+        msf = ttk.Frame(win)
+        msf.grid(row=ms_row, column=0, columnspan=4, sticky='w', padx=5, pady=2)
+        ttk.Label(msf, text='Start search (Å)').pack(side=tk.LEFT, padx=(0, 4))
+        max_dist_var = tk.StringVar(value='3'); pvars['max_dist'] = max_dist_var
+        ttk.Entry(msf, textvariable=max_dist_var, width=6).pack(side=tk.LEFT, padx=(0, 4))
+        ms_tip = ttk.Label(msf, text='ⓘ', foreground='#3a6ea5', cursor='question_arrow')
+        ms_tip.pack(side=tk.LEFT)
+        create_tooltip(ms_tip, "With Auto-snap ON: how far the plugin may move your click\n"
+                               "toward the roomiest nearby buried spot.\n"
+                               "With Auto-snap OFF: CAVER's own max_distance -- how far\n"
+                               "CAVER walks the start toward open space.\n"
+                               "Either way, raise it first if you get 0 tunnels; too large\n"
+                               "can drift into a neighbouring pocket.")
 
         # Reuse the main dialog's "Exclude residues" selection: when ticked, whatever is
         # highlighted there (a bound ligand, cofactors, ...) is deleted from CAVER's input
         # in addition to water -- e.g. exclude the ligand you started on so tunnels pass
         # through the vacated binding site.
         caver_exclude_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(win, text='Also exclude residues ticked in the Exclude list',
-                        variable=caver_exclude_var).grid(
-            row=param_base + len(params), column=0, columnspan=3, sticky='w', **pad)
+        excl_row = ms_row + 1
+        excl_chk = ttk.Checkbutton(win, text='Also exclude ticked residues',
+                                   variable=caver_exclude_var)
+        excl_chk.grid(row=excl_row, column=0, columnspan=4, sticky='w', padx=5, pady=(4, 2))
+        create_tooltip(excl_chk, 'Also drop the residues currently selected in the main dialog\'s\n'
+                                 '"Exclude residues" list from CAVER\'s input (e.g. the ligand you\n'
+                                 'started on, so tunnels pass through the vacated site).')
 
         def _do_run():
             try:
@@ -1780,9 +1784,18 @@ def tunneler_dialog():
 
         win.protocol('WM_DELETE_WINDOW', _cancel)
         btnf = ttk.Frame(win)
-        btnf.grid(row=param_base + len(params) + 1, column=0, columnspan=3, pady=(8, 10))
+        btnf.grid(row=excl_row + 1, column=0, columnspan=4, pady=(6, 8))
         ttk.Button(btnf, text='Run', command=_do_run).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text='Cancel', command=_cancel).pack(side=tk.LEFT, padx=6)
+
+        # Unfold like a menu from the Load button: place the dialog's top-right corner at the
+        # button's bottom-right, so it drops down-and-left from the icon that opened it. Clamp
+        # x >= 0 so a narrow screen can't push it off the left edge.
+        win.update_idletasks()
+        bx, by = load_button.winfo_rootx(), load_button.winfo_rooty()
+        bw, bh = load_button.winfo_width(), load_button.winfo_height()
+        x = max(bx + bw - win.winfo_reqwidth(), 0)
+        win.geometry(f'+{x}+{by + bh}')
 
     def _sync_dialog_to_scene():
         """After LoadSce, make the dialog reflect the freshly loaded scene: refresh the
