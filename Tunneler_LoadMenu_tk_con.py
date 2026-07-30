@@ -1499,6 +1499,15 @@ def tunneler_dialog():
             pvars[key] = v
             ttk.Entry(win, textvariable=v, width=8).grid(row=2 + i, column=1, sticky='w', **pad)
 
+        # Reuse the main dialog's "Exclude residues" selection: when ticked, whatever is
+        # highlighted there (a bound ligand, cofactors, ...) is deleted from CAVER's input
+        # in addition to water -- e.g. exclude the ligand you started on so tunnels pass
+        # through the vacated binding site.
+        caver_exclude_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(win, text='Also exclude residues ticked in the Exclude list',
+                        variable=caver_exclude_var).grid(
+            row=2 + len(params), column=0, columnspan=3, sticky='w', **pad)
+
         def _do_run():
             try:
                 probe = float(pvars['probe'].get())
@@ -1525,6 +1534,11 @@ def tunneler_dialog():
             # and discard the copy. Non-water ligands/cofactors are kept (obstacles).
             dup = DuplicateObj(prot_obj)[0]
             DelRes(f'Obj {dup} Res HOH')
+            if caver_exclude_var.get():
+                # each Exclude-list item is 'RESNAME RESNUM' (e.g. 'NCA 603') -> a precise
+                # residue selection; delete them one by one from the copy.
+                for item in [listbox.get(idx) for idx in listbox.curselection()]:
+                    DelRes(f'Obj {dup} Res {item}')
             # transform='No' writes the object's LOCAL frame (X-flipped for PDB), matching
             # the local/X-negated start point above -- see _capture_start. Using the default
             # (transform='Yes') bakes in the centering rotation and desyncs the two frames.
@@ -1540,7 +1554,7 @@ def tunneler_dialog():
             _poll_caver(proc, out_dir)
 
         btnf = ttk.Frame(win)
-        btnf.grid(row=2 + len(params), column=0, columnspan=3, pady=(8, 10))
+        btnf.grid(row=3 + len(params), column=0, columnspan=3, pady=(8, 10))
         ttk.Button(btnf, text='Run', command=_do_run).pack(side=tk.LEFT, padx=6)
         ttk.Button(btnf, text='Cancel', command=win.destroy).pack(side=tk.LEFT, padx=6)
 
