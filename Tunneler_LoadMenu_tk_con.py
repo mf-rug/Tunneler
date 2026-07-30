@@ -1192,12 +1192,144 @@ def tunneler_dialog():
         Console("hidden")
         _sync_dialog_to_scene()
 
-    def import_caver():
-        """Import CAVER tunnel output into the scene. Implemented in phase (d)."""
+    def _caver_msg(text, secs=60):
+        Console("OFF"); ShowMessage(text); Wait(secs); HideMessage(); Console("hidden")
+
+    def _ask_align_target(candidate_objnums):
+        """Modal picker: choose a loaded object to SHEBA-align the CAVER structure onto, or
+        Skip to leave CAVER's coordinates as-is. Returns an object-number string or None."""
+        labels = ListObj(" ".join(str(o) for o in candidate_objnums), format='OBJNUM: OBJNAME')
+        win = tk.Toplevel(root)
+        win.title('Align CAVER structure?')
+        win.attributes('-topmost', True)
+        tk.Label(win, text=('Align the CAVER structure onto a loaded object?\n'
+                            '(or Skip to leave its coordinates unchanged)')).pack(padx=10, pady=(10, 4))
+        lb = tk.Listbox(win, height=min(6, max(1, len(labels))), width=34, exportselection=False)
+        for lab in labels:
+            lb.insert(tk.END, lab)
+        lb.pack(padx=10, pady=4)
+        if labels:
+            lb.selection_set(0)
+        result = {'obj': None}
+        def _do_align():
+            sel = lb.curselection()
+            if sel:
+                m = re.findall(r'\d+(?=:)', lb.get(sel[0]))
+                result['obj'] = m[0] if m else None
+            win.destroy()
+        btnf = tk.Frame(win)
+        btnf.pack(pady=(4, 10))
+        ttk.Button(btnf, text='Align', command=_do_align).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnf, text='Skip', command=win.destroy).pack(side=tk.LEFT, padx=6)
+        win.grab_set()
+        win.wait_window()
+        return result['obj']
+
+    def _show_caver_spheres(sel):
+        """Render each pseudo-atom in `sel` as a sphere sized by its B-factor (= CAVER tunnel
+        radius) and coloured by the atom's colour, joined into one 'caver_sphere' object."""
         Console("OFF")
-        ShowMessage('CAVER import is not wired up yet.')
-        Wait(30)
+        atomnums = ListAtom(sel)
+        if not atomnums:
+            Console("hidden"); return
+        cols = ColorAtom(sel)
+        rads = BFactorAtom(sel)
+        pos = PosAtom(sel, coordsys='global')          # flat [x1,y1,z1, x2,y2,z2, ...]
+        for i in range(len(atomnums)):
+            obj = ShowSphere(radius=rads[i], color=cols[i], alpha=100, level=2)
+            PosObj(obj, pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2])
+        # ShowSphere names its objects 'Sphere'; the plugin's own meshes are 'NNN_Sphere',
+        # so this selection never catches them.
+        spheres = ListObj('Sphere')
+        if spheres:
+            jobj = spheres[0]
+            JoinObj('Sphere', jobj)
+            NameObj(jobj, 'caver_sphere')
+        Console("hidden")
+
+    def import_caver():
+        """Import CAVER tunnel output as a rainbow 'beads on a string' overlay.
+
+        Pick a CAVER output folder; we locate .../data/clusters_timeless/*.pdb (per-cluster
+        tunnel pseudo-atom strings, B-factor = tunnel radius) and the input structure at the
+        sibling .../inputs/*.pdb. Each cluster becomes a molecule tA, tB... joined into one
+        'caver' object and coloured by hue, then every pseudo-atom is drawn as a sphere sized
+        by its B-factor. Optionally SHEBA-aligns onto a loaded object (moving the tunnels with
+        it) so the overlay matches your working structure."""
+        Console("OFF")
+        folder = filedialog.askdirectory(
+            parent=root, title="Select the CAVER output folder (contains data/clusters_timeless)")
+        Console("hidden")
+        if not folder:
+            return
+
+        # Locate clusters_timeless anywhere under the selection.
+        clusters_dir = None
+        for dirpath, _dirs, _files in os.walk(folder):
+            if os.path.basename(dirpath) == 'clusters_timeless':
+                clusters_dir = dirpath
+                break
+        if clusters_dir is None:
+            _caver_msg("No 'clusters_timeless' folder found under the selection.")
+            return
+        tunnel_pdbs = sorted(os.path.join(clusters_dir, f)
+                             for f in os.listdir(clusters_dir) if f.lower().endswith('.pdb'))
+        if not tunnel_pdbs:
+            _caver_msg("No tunnel PDB files found in clusters_timeless.")
+            return
+
+        # Input structure: sibling <run>/inputs/*.pdb (run root = parent of the 'data' dir);
+        # else a non-origin .pdb in the clusters' parent 'data' dir.
+        data_dir = os.path.dirname(clusters_dir)
+        run_root = os.path.dirname(data_dir)
+        protein_pdb = None
+        inputs_dir = os.path.join(run_root, 'inputs')
+        if os.path.isdir(inputs_dir):
+            cand = [f for f in sorted(os.listdir(inputs_dir)) if f.lower().endswith('.pdb')]
+            if cand:
+                protein_pdb = os.path.join(inputs_dir, cand[0])
+        if protein_pdb is None:
+            cand = [f for f in sorted(os.listdir(data_dir))
+                    if f.lower().endswith('.pdb') and 'origin' not in f.lower()]
+            if cand:
+                protein_pdb = os.path.join(data_dir, cand[0])
+        if protein_pdb is None:
+            _caver_msg("Found tunnels but no CAVER input structure (inputs/*.pdb).")
+            return
+
+        Console("OFF")
+        pre_objs = ListObj('all')                       # align candidates: objects present before import
+        prot = LoadPDB(protein_pdb, center=False, correct=False)[0]
+
+        mols = []
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        n = len(tunnel_pdbs)
+        for i, pdb in enumerate(tunnel_pdbs):
+            ShowMessage(f'Loading CAVER tunnel {i + 1} / {n}')
+            tun = LoadPDB(pdb, center=False, correct=False)[0]
+            ColorObj(tun, int(360 / n * i))
+            molname = 't' + alphabet[i % len(alphabet)]
+            NameMol(f'obj {tun}', molname)
+            mols.append(molname)
+            JoinObj(tun, prot)
+            Wait(1)
         HideMessage()
+        NameObj(prot, 'caver')
+        Console("hidden")
+
+        # Optional SHEBA alignment onto a pre-existing object (moves the joined tunnels too).
+        if pre_objs:
+            tgt = _ask_align_target(pre_objs)
+            if tgt is not None:
+                Console("OFF")
+                ShowMessage('Aligning CAVER structure...')
+                AlignObj(prot, tgt, method='sheba')
+                HideMessage()
+                Console("hidden")
+
+        Console("OFF")
+        HideObj(prot)
+        _show_caver_spheres(f'Obj {prot} Mol {" ".join(mols)}')
         Console("hidden")
 
     def _sync_dialog_to_scene():
