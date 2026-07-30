@@ -15,6 +15,7 @@ install. Only the GPLv3 CAVER 3.0 engine is used -- never the non-commercial CAV
 CaverDock / Caver Web components.
 """
 
+import math
 import os
 import shutil
 import subprocess
@@ -70,8 +71,8 @@ generate_profile_heat_map no
 compute_tunnel_residues no
 compute_bottleneck_residues no
 
-max_distance 3
-desired_radius 5
+max_distance {max_distance}
+desired_radius {desired_radius}
 number_of_approximating_balls 12
 add_central_sphere yes
 max_number_of_tunnels 10000
@@ -189,16 +190,132 @@ def download_caver(progress_cb=None, url=CAVER_DOWNLOAD_URL, dest_root=DEFAULT_C
 
 
 def make_config(start_xyz, probe_radius=0.9, shell_radius=3, shell_depth=4,
-                clustering_threshold=3.5, include_residue_names=None):
+                clustering_threshold=3.5, max_distance=3, desired_radius=5,
+                include_residue_names=None):
     """Return the text of a CAVER config for a single static structure, with the tunnel
-    origin fixed at `start_xyz` (a 3-tuple in the structure's coordinate frame)."""
+    origin fixed at `start_xyz` (a 3-tuple in the structure's coordinate frame).
+
+    `max_distance`/`desired_radius` drive CAVER's starting-point optimization: from the
+    given origin CAVER walks up to `max_distance` A toward open space, stopping once it
+    finds a spot with `desired_radius` A of clearance (or the roomiest point within reach).
+    A larger `max_distance` makes picking forgiving -- the user can mark an atom near a
+    cavity rather than exactly inside it -- at the cost of possibly drifting into an
+    adjacent pocket, so keep it modest."""
     x, y, z = start_xyz
     include_line = ('include_residue_names ' + include_residue_names) if include_residue_names else ''
     return CONFIG_TEMPLATE.format(
         start_x=x, start_y=y, start_z=z,
         probe_radius=probe_radius, shell_radius=shell_radius,
         shell_depth=shell_depth, clustering_threshold=clustering_threshold,
+        max_distance=max_distance, desired_radius=desired_radius,
         include_line=include_line)
+
+
+# ---------------------------------------------------------------------------
+# Start-point snapping
+# ---------------------------------------------------------------------------
+# CAVER's own start optimization (max_distance/desired_radius) is a local greedy
+# climb toward the biggest empty sphere -- it is blind to whether that sphere is a
+# buried cavity or a surface dimple, so raising its leash to reach a mis-picked
+# start just as easily drifts onto the surface or into a neighbouring pocket. We
+# have the whole structure in hand, so we can do better before CAVER ever runs:
+# climb toward maximum clearance *subject to staying buried*, which is exactly the
+# constraint CAVER omits. `atoms` is a list of (x, y, z, vdw_radius) tuples in the
+# same coordinate frame as `pick` -- pass the water-excluded protein atoms, i.e.
+# the same set CAVER will see. All pure math (no numpy) so it stays headless.
+
+def _sphere_directions(n):
+    """`n` roughly-uniform unit vectors on the sphere (deterministic Fibonacci spiral)."""
+    dirs = []
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    for i in range(n):
+        z = 1.0 - (2.0 * i + 1.0) / n
+        r = math.sqrt(max(0.0, 1.0 - z * z))
+        theta = golden * i
+        dirs.append((r * math.cos(theta), r * math.sin(theta), z))
+    return dirs
+
+
+def point_clearance(point, atoms):
+    """Radius of the largest empty sphere centred at `point`: min over atoms of
+    (centre distance - vdW radius). Negative if `point` sits inside an atom."""
+    px, py, pz = point
+    best = float('inf')
+    for ax, ay, az, ar in atoms:
+        d = math.sqrt((px - ax) ** 2 + (py - ay) ** 2 + (pz - az) ** 2) - ar
+        if d < best:
+            best = d
+    return best
+
+
+def point_burial(point, atoms, directions, ray_length=10.0, probe=0.0):
+    """Fraction of `directions` in which a ray from `point` hits an atom within
+    `ray_length` A. ~1.0 = enclosed (buried), low = open to solvent (surface)."""
+    px, py, pz = point
+    blocked = 0
+    for ux, uy, uz in directions:
+        for ax, ay, az, ar in atoms:
+            wx, wy, wz = ax - px, ay - py, az - pz
+            t = wx * ux + wy * uy + wz * uz          # projection onto the ray
+            if t <= 0.0 or t > ray_length:
+                continue
+            rr = ar + probe
+            if (wx * wx + wy * wy + wz * wz) - t * t <= rr * rr:  # perp dist^2 <= r^2
+                blocked += 1
+                break
+    return blocked / len(directions) if directions else 0.0
+
+
+def snap_start_point(pick, atoms, max_step=4.0, burial_min=0.6,
+                     directions=32, ray_length=10.0, step0=1.0, step_min=0.1):
+    """Move `pick` toward the roomiest nearby *buried* spot and report the result.
+
+    Pattern-search hill-climb: from the current best, probe the `directions` unit
+    vectors at the current step size, keep the move with the largest clearance that
+    both stays within `max_step` A of the original pick and keeps burial >=
+    `burial_min`; halve the step when no probe improves; stop at `step_min`.
+
+    Returns a dict: snapped (x,y,z), clearance, burial, displacement (A moved), and
+    pick_clearance / pick_burial for the raw pick (drives the 'looks surface/tight'
+    warning). Purely advisory -- the caller decides whether to use `snapped`."""
+    dirs = _sphere_directions(directions)
+    # Prefilter to atoms a ray could reach from anywhere in the search ball -- one
+    # pass, then clearance/burial only scan this local subset.
+    reach = max_step + ray_length + 3.0
+    px, py, pz = pick
+    near = [a for a in atoms
+            if (a[0] - px) ** 2 + (a[1] - py) ** 2 + (a[2] - pz) ** 2 <= reach * reach]
+    if not near:
+        near = atoms
+
+    def clr(p):
+        return point_clearance(p, near)
+
+    def bur(p):
+        return point_burial(p, near, dirs, ray_length)
+
+    origin = pick
+    pick_clear = clr(pick)
+    pick_bur = bur(pick)
+    best, best_clear = pick, pick_clear
+    step = step0
+    while step >= step_min:
+        improved = False
+        for ux, uy, uz in dirs:
+            cand = (best[0] + ux * step, best[1] + uy * step, best[2] + uz * step)
+            dx, dy, dz = cand[0] - origin[0], cand[1] - origin[1], cand[2] - origin[2]
+            if dx * dx + dy * dy + dz * dz > max_step * max_step:
+                continue
+            if bur(cand) < burial_min:
+                continue
+            c = clr(cand)
+            if c > best_clear + 1e-6:
+                best, best_clear, improved = cand, c, True
+        if not improved:
+            step *= 0.5
+    disp = math.sqrt(sum((best[i] - origin[i]) ** 2 for i in range(3)))
+    return {'snapped': best, 'clearance': best_clear, 'burial': bur(best),
+            'displacement': disp, 'pick_clearance': pick_clear, 'pick_burial': pick_bur}
 
 
 def build_command(java, caver_home, input_dir, config_path, out_dir, heap_mb=2000):

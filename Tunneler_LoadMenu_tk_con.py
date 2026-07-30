@@ -1455,49 +1455,227 @@ def tunneler_dialog():
         ttk.Label(win, text=f'Structure:  {NameObj(prot_obj)[0]} (obj {prot_obj})',
                   font='TkSmallCaptionFont').grid(row=0, column=0, columnspan=3, sticky='w', **pad)
 
+        # start_point carries the picked start across the widgets and the run. Everything is
+        # kept in view-independent LOCAL coords; 'global' is camera-relative and would go stale
+        # the moment the scene is rotated/zoomed. Keys: raw_local/snap_local -- the pick and the
+        # burial-snapped point in the object's local frame; raw_caver/snap_caver -- the same two
+        # with X negated (the CAVER/SavePDB(transform='No') frame, used for the config); diag --
+        # the snap_start_point() report; preview -- the YASARA marker objects.
+        start_point = {'raw_caver': None}
+        atoms_cache = {}
+
+        def _protein_atoms_local():
+            """(x, y, z, vdW) for every non-water atom of the target, in the object's LOCAL
+            frame -- the atom set the snap climbs over. Local coords are glued to the structure,
+            unlike 'global' which is camera-relative (0/0/0 = window centre) and shifts on every
+            zoom/rotate; so this cache stays valid and the snap is immune to view changes."""
+            if 'a' not in atoms_cache:
+                s = f'Obj {prot_obj} Res !HOH'
+                p = PosAtom(s, coordsys='local')
+                rad = RadiusAtom(s, Type='VdW')
+                atoms_cache['a'] = [(p[i], p[i + 1], p[i + 2], rad[i // 3])
+                                    for i in range(0, len(p), 3)]
+            return atoms_cache['a']
+
+        def _local_to_global(lx, ly, lz):
+            """Global (screen) coords of a LOCAL point, computed FRESH for the current view --
+            needed only to place the preview spheres, which live in the global frame. YASARA has
+            no bare-coordinate transform, so borrow the object transform via a throwaway
+            duplicate: park its first atom at the local point, read the atom's global coords,
+            discard the copy. Done at draw time so the markers land correctly wherever the camera
+            is now; once placed, a sphere is a scene object and tracks the structure afterwards."""
+            dup = DuplicateObj(prot_obj)[0]
+            a0 = ListAtom(f'Obj {dup}')[0]
+            PosAtom(f'Atom {a0}', lx, ly, lz, coordsys='local')
+            g = PosAtom(f'Atom {a0}', coordsys='global')
+            DelObj(dup)
+            return (g[0], g[1], g[2])
+
+        def _snap_leash():
+            try:
+                return max(float(pvars['max_dist'].get()), 0.1)
+            except (ValueError, KeyError):
+                return 3.0
+
+        def _compute_snap(pick_local):
+            """Burial-constrained snap of a LOCAL pick; the returned report's 'snapped' point is
+            also in the local frame (clearance/burial are distances, so frame doesn't matter)."""
+            return caver.snap_start_point(pick_local, _protein_atoms_local(),
+                                          max_step=_snap_leash(), burial_min=0.6)
+
+        def _clear_preview():
+            # Preview markers are named 'TnlSnap'; delete by name so shifting object numbers
+            # can't make us remove the wrong object. No-op (silently) if none are present.
+            try:
+                DelObj('Obj TnlSnap')
+            except Exception:
+                pass
+            start_point['preview'] = []
+
+        def _draw_preview(pick_local, snap_local, diag):
+            """Magenta ball = your click; yellow ball = where it snaps; translucent yellow =
+            the open space found; orange arrow = the move. Inputs are LOCAL points, converted to
+            global here (fresh, current view) so the markers land on the structure no matter how
+            the scene is currently rotated or zoomed."""
+            _clear_preview()
+            try:
+                px, py, pz = _local_to_global(*pick_local)
+                click = ShowSphere(radius=0.5, color='ff00ff', alpha=100, level=2)
+                PosObj(click, px, py, pz); NameObj(click, 'TnlSnap')
+                if snap_local is not None:
+                    sx, sy, sz = _local_to_global(*snap_local)
+                    if diag and diag['clearance'] > 0:
+                        void = ShowSphere(radius=diag['clearance'], color='ffff00', alpha=20, level=2)
+                        PosObj(void, sx, sy, sz); NameObj(void, 'TnlSnap')
+                    snp = ShowSphere(radius=0.5, color='ffff00', alpha=100, level=2)
+                    PosObj(snp, sx, sy, sz); NameObj(snp, 'TnlSnap')
+                    arrow = ShowArrow2('Point', px, py, pz, 'Point', sx, sy, sz,
+                                       radius=0.12, heads=1, color='ff8000')
+                    NameObj(arrow, 'TnlSnap')  # so _clear_preview() removes it too
+            except Exception:
+                pass
+
         # Starting point -------------------------------------------------------
         ttk.Label(win, text='Starting point').grid(row=1, column=0, sticky='w', **pad)
-        start_lbl = ttk.Label(win, text='(mark an atom in the cavity)', foreground='#555')
+        start_lbl = ttk.Label(win, text='(mark an atom, or use center of gravity)', foreground='#555')
         start_lbl.grid(row=1, column=1, sticky='w', **pad)
-        start_point = {'xyz': None}
+
+        def _render_start():
+            """Draw the preview + set the labels for the ALREADY-captured pick, honouring the
+            Auto-snap checkbox. Split out from _capture_start so toggling the checkbox re-renders
+            (snap on -> 4 markers + green 'snapped' readout; off -> 1 marker + raw clr/bur, so the
+            toggle visibly changes the scene and the text). No-op until a pick has been captured."""
+            if start_point.get('raw_local') is None:
+                return
+            Console("OFF")
+            try:
+                pick_l = start_point['raw_local']
+                if caver_snap_var.get():
+                    s = _compute_snap(pick_l)
+                    snap_l = s['snapped']
+                    # CAVER frame = local with X negated (matches SavePDB(transform='No')).
+                    start_point['snap_caver'] = (-snap_l[0], snap_l[1], snap_l[2])
+                    start_point['snap_local'] = snap_l
+                    start_point['diag'] = s
+                    _draw_preview(pick_l, snap_l, s)
+                    start_lbl.config(text='snapped into cavity', foreground='#1a7f1a')
+                    snap_lbl.config(
+                        text='pick clr %.1f Å / bur %.0f%%   →   snap clr %.1f Å / bur %.0f%%   '
+                             '(moved %.1f Å)' % (s['pick_clearance'], 100 * s['pick_burial'],
+                                                 s['clearance'], 100 * s['burial'], s['displacement']),
+                        foreground='#1a7f1a')
+                else:
+                    start_point.pop('snap_caver', None)
+                    atoms = _protein_atoms_local()
+                    clr = caver.point_clearance(pick_l, atoms)
+                    bur = caver.point_burial(pick_l, atoms, caver._sphere_directions(32))
+                    _draw_preview(pick_l, None, None)
+                    cx, cy, cz = start_point['raw_caver']
+                    start_lbl.config(text='%.2f, %.2f, %.2f  (raw click)' % (cx, cy, cz),
+                                     foreground='black')
+                    warn = '   ⚠ looks surface-exposed' if bur < 0.5 else ''
+                    snap_lbl.config(text='clearance %.1f Å / burial %.0f%%%s' % (clr, 100 * bur, warn),
+                                    foreground=('#b06000' if warn else '#555'))
+            finally:
+                Console("hidden")
 
         def _capture_start():
             Console("OFF")
-            # Clicking an atom in YASARA MARKS it (white firefly); MarkAtom() returns up to
-            # four marked atom numbers (0 = that slot unmarked). Use the marked atom(s), not
-            # the selection -- a click doesn't 'select'.
-            marked = [a for a in MarkAtom() if a]
-            if not marked:
+            try:
+                # Clicking an atom in YASARA MARKS it (white firefly); MarkAtom() returns up to
+                # four marked atom numbers (0 = that slot unmarked). A click doesn't 'select',
+                # so read the pick from MarkAtom(), not ListAtom('Selected').
+                marked = [a for a in MarkAtom() if a]
+                if not marked:
+                    _caver_msg('Click an atom in YASARA to mark it (white firefly), then press '
+                               'this again.')
+                    return
+                sel = 'Atom ' + ' '.join(str(a) for a in marked)
+                # Work in the object's LOCAL frame (view-independent). CAVER frame = local with X
+                # negated -- the frame SavePDB(transform='No') writes, so start point and saved
+                # structure share one frame; global + transform='Yes' desync and find 0 tunnels.
+                lo = PosAtom(sel, coordsys='local'); k = len(marked)
+                pick_l = (sum(lo[0::3]) / k, sum(lo[1::3]) / k, sum(lo[2::3]) / k)
+                start_point['raw_local'] = pick_l
+                start_point['raw_caver'] = (-pick_l[0], pick_l[1], pick_l[2])
+                start_point.pop('snap_caver', None)
+            finally:
                 Console("hidden")
-                _caver_msg('Click an atom in YASARA to mark it (white firefly), then press this again.')
-                return
-            sel = 'Atom ' + ' '.join(str(a) for a in marked)
-            # Use LOCAL coords with X negated: that is exactly the frame SavePDB(transform=
-            # 'No') writes, so the start point and the saved structure share one frame. Do
-            # NOT use PosAtom 'global' + SavePDB default -- YASARA's centering rotation plus
-            # its PDB X-flip put those in different frames, so the start point landed nowhere
-            # near the protein and every run silently found zero tunnels.
-            pos = PosAtom(sel, coordsys='local')
-            Console("hidden")
-            k = len(marked)
-            start_point['xyz'] = (-sum(pos[0::3]) / k, sum(pos[1::3]) / k, sum(pos[2::3]) / k)
-            x, y, z = start_point['xyz']
-            start_lbl.config(text=f'{x:.2f}, {y:.2f}, {z:.2f}', foreground='black')
+            _render_start()
 
-        ttk.Button(win, text='Use marked atom', command=_capture_start).grid(
-            row=1, column=2, sticky='w', **pad)
+        def _use_cog():
+            # No-click alternative: start from the target's centre of gravity (geometric centre
+            # of its non-water atoms), then let Auto-snap climb from there. On its own a protein's
+            # COG sits in the packed core and CAVER finds nothing -- but the snap can walk it into
+            # a nearby buried void, and the clearance/burial readout makes plain whether it landed
+            # somewhere usable, so it's an honest quick-start rather than a silent dead end.
+            Console("OFF")
+            try:
+                s = f'Obj {prot_obj} Res !HOH'
+                lo = PosAtom(s, coordsys='local', mean='Yes')
+                pick_l = (lo[0], lo[1], lo[2])
+                start_point['raw_local'] = pick_l
+                start_point['raw_caver'] = (-pick_l[0], pick_l[1], pick_l[2])
+                start_point.pop('snap_caver', None)
+            finally:
+                Console("hidden")
+            _render_start()
+
+        srcf = ttk.Frame(win)
+        srcf.grid(row=1, column=2, sticky='w', **pad)
+        ttk.Button(srcf, text='Marked atom', width=15, command=_capture_start).pack(
+            side=tk.TOP, anchor='w', pady=1)
+        ttk.Button(srcf, text='Center of gravity', width=15, command=_use_cog).pack(
+            side=tk.TOP, anchor='w', pady=1)
+
+        # Auto-snap toggle + live clearance/burial readout ---------------------
+        caver_snap_var = tk.BooleanVar(value=True)
+        snap_help = ("On (recommended): the plugin nudges your click toward the\n"
+                     "roomiest nearby BURIED spot before running -- so you can mark\n"
+                     "an atom near the pocket instead of exactly inside it, and it\n"
+                     "won't drift onto the surface.\n"
+                     "   Magenta ball = your click\n"
+                     "   Yellow ball  = the snapped seed\n"
+                     "   Faint yellow = the open space found\n"
+                     "Off: your click is used as-is and CAVER's own start-point\n"
+                     "optimization ('Start-point search') is applied instead.")
+        snap_chk = ttk.Checkbutton(win, text='Auto-snap start into cavity',
+                                   variable=caver_snap_var, command=_render_start)
+        snap_chk.grid(row=2, column=0, columnspan=2, sticky='w', **pad)
+        snap_tip = ttk.Label(win, text='ⓘ', foreground='#3a6ea5', cursor='question_arrow')
+        snap_tip.grid(row=2, column=2, sticky='w', **pad)
+        create_tooltip(snap_tip, snap_help)
+        create_tooltip(snap_chk, snap_help)
+        snap_lbl = ttk.Label(win, text='', foreground='#555')
+        snap_lbl.grid(row=3, column=0, columnspan=3, sticky='w', padx=8)
 
         # Parameters -----------------------------------------------------------
         params = [('Probe radius (Å)', 'probe', '0.9'),
                   ('Shell radius (Å)', 'shell_r', '3'),
                   ('Shell depth', 'shell_d', '4'),
-                  ('Clustering threshold', 'clust', '3.5')]
+                  ('Clustering threshold', 'clust', '3.5'),
+                  ('Start-point search (Å)', 'max_dist', '3')]
+        param_base = 4  # first parameter row (rows 1-3 are the start-point block)
+        param_help = {
+            'max_dist': ("With Auto-snap ON: how far the plugin may move your click\n"
+                         "toward the roomiest nearby buried spot.\n"
+                         "With Auto-snap OFF: CAVER's own max_distance -- how far\n"
+                         "CAVER walks the start toward open space.\n"
+                         "Either way, raise it first if you get 0 tunnels; too large\n"
+                         "can drift into a neighbouring pocket."),
+        }
         pvars = {}
         for i, (label, key, default) in enumerate(params):
-            ttk.Label(win, text=label).grid(row=2 + i, column=0, sticky='w', **pad)
+            lbl = ttk.Label(win, text=label)
+            lbl.grid(row=param_base + i, column=0, sticky='w', **pad)
             v = tk.StringVar(value=default)
             pvars[key] = v
-            ttk.Entry(win, textvariable=v, width=8).grid(row=2 + i, column=1, sticky='w', **pad)
+            ttk.Entry(win, textvariable=v, width=8).grid(row=param_base + i, column=1, sticky='w', **pad)
+            if key in param_help:
+                tip = ttk.Label(win, text='ⓘ', foreground='#3a6ea5', cursor='question_arrow')
+                tip.grid(row=param_base + i, column=2, sticky='w', **pad)
+                create_tooltip(tip, param_help[key])
+                create_tooltip(lbl, param_help[key])
 
         # Reuse the main dialog's "Exclude residues" selection: when ticked, whatever is
         # highlighted there (a bound ligand, cofactors, ...) is deleted from CAVER's input
@@ -1506,7 +1684,7 @@ def tunneler_dialog():
         caver_exclude_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(win, text='Also exclude residues ticked in the Exclude list',
                         variable=caver_exclude_var).grid(
-            row=2 + len(params), column=0, columnspan=3, sticky='w', **pad)
+            row=param_base + len(params), column=0, columnspan=3, sticky='w', **pad)
 
         def _do_run():
             try:
@@ -1514,15 +1692,33 @@ def tunneler_dialog():
                 shell_r = float(pvars['shell_r'].get())
                 shell_d = int(float(pvars['shell_d'].get()))
                 clust = float(pvars['clust'].get())
+                max_dist = float(pvars['max_dist'].get())
             except ValueError:
                 _caver_msg('Parameters must be numbers.')
                 return
-            xyz = start_point['xyz']
-            if xyz is None:
+            if max_dist < 0:
+                _caver_msg('Start-point search (Å) must be zero or positive.')
+                return
+            if start_point.get('raw_caver') is None:
                 _caver_msg('Mark an atom in YASARA near the cavity of interest (click it, white '
                            'firefly), then press "Use marked atom". CAVER needs a start point '
                            'inside a buried cavity -- the protein centre does not work.')
                 return
+            # Resolve the start point at run time so the Auto-snap checkbox is authoritative:
+            #  snap ON  -> use the snapped seed (compute it now if the box was toggled on after
+            #              the last capture) and keep CAVER's own leash tight, since we already
+            #              did the moving; snap OFF -> raw pick + CAVER's max_distance = the field.
+            if caver_snap_var.get():
+                if 'snap_caver' not in start_point:
+                    s = _compute_snap(start_point['raw_local'])
+                    snap_l = s['snapped']
+                    start_point['snap_caver'] = (-snap_l[0], snap_l[1], snap_l[2])
+                xyz = start_point['snap_caver']
+                caver_md = min(max_dist, 1.0)
+            else:
+                xyz = start_point['raw_caver']
+                caver_md = max_dist
+            _clear_preview()  # markers would only clutter the imported tunnels
             run_dir = tempfile.mkdtemp(prefix='tunneler_caver_')
             in_dir = os.path.join(run_dir, 'input')
             os.makedirs(in_dir)
@@ -1548,15 +1744,21 @@ def tunneler_dialog():
             cfg_path = os.path.join(run_dir, 'config.txt')
             with open(cfg_path, 'w') as f:
                 f.write(caver.make_config(xyz, probe_radius=probe, shell_radius=shell_r,
-                                          shell_depth=shell_d, clustering_threshold=clust))
+                                          shell_depth=shell_d, clustering_threshold=clust,
+                                          max_distance=caver_md))
             proc = caver.start_caver(caver.find_java(), home, in_dir, cfg_path, out_dir)
             win.destroy()
             _poll_caver(proc, out_dir)
 
+        def _cancel():
+            Console("OFF"); _clear_preview(); Console("hidden")
+            win.destroy()
+
+        win.protocol('WM_DELETE_WINDOW', _cancel)
         btnf = ttk.Frame(win)
-        btnf.grid(row=3 + len(params), column=0, columnspan=3, pady=(8, 10))
+        btnf.grid(row=param_base + len(params) + 1, column=0, columnspan=3, pady=(8, 10))
         ttk.Button(btnf, text='Run', command=_do_run).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btnf, text='Cancel', command=win.destroy).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnf, text='Cancel', command=_cancel).pack(side=tk.LEFT, padx=6)
 
     def _sync_dialog_to_scene():
         """After LoadSce, make the dialog reflect the freshly loaded scene: refresh the
