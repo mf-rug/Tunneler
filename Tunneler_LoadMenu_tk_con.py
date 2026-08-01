@@ -3032,7 +3032,11 @@ def tunneler_dialog():
                 tnl_insp_options_list.append(x)
             update_option_menu(tab3_inspect, tnl_insp_option, tnl_insp_options_list, current_value='All')
             # Precompute the concave-hull critical radius R* into the Property field so the
-            # Surface-points knob in the Appearance tab is instant from the first drag.
+            # Surface-points knob in the Appearance tab is instant from the first drag. This
+            # is the post-clustering "finishing up" step (where the old roughsurf surface
+            # build used to sit); caption it so the HUD doesn't linger on the stale
+            # "Finished clustering" message. Wait(1) forces a repaint before the ~0.8s sweep.
+            ShowMessage('Finishing up: preparing surface trim...'); Wait(1)
             _precompute_hull_radius(target())
             # Performant mode: auto-apply the render performance cull (what the old
             # "Improve performance" button did), so lightened rendering is on by default.
@@ -3041,6 +3045,7 @@ def tunneler_dialog():
             # Auto-trim the exposed exterior at the default probe radius (additive, so it
             # composes with any perf-mode interior hiding just applied).
             _apply_hull_trim(target(), surf_pts_chk.get())
+            HideMessage()
         # "Also run CAVER" (tab-1 checkbox): seed CAVER from the tunnels just found and launch it
         # in the background. mds>0 -> the MD frames become CAVER trajectory snapshots. Runs after
         # the tabs/appearance are set up so the Tunneler result is already on screen.
