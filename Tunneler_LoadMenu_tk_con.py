@@ -961,7 +961,6 @@ def tunneler_dialog():
             else:
                 # renaming makes its name match downstream
                 NameObj(f'{tar}excl_pts', f'{tar}C00000000')
-                SegObj(f'{tar}roughsurf', '.')
                 ShowObj(f'{tar}Cl???????')
             
         get_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tunneler_config.ini'))
@@ -1780,26 +1779,20 @@ def tunneler_dialog():
         Rationale: CAVER from a single interior point only reaches what's connected to it, so a
         lone seed misses disconnected cavities (e.g. a central channel vs an off-centre subdomain
         pocket). Tunneler's clusters already ARE the distinct cavity systems, so we seed one per
-        cluster: within each cluster take the bead nearest that cavity's own (deep-part) centre
-        that is deep below the surface, roomy enough for CAVER (clearance >= probe) and BURIED.
-        Clusters with no such bead (surface grooves / too shallow) are skipped. Largest clusters
+        cluster: within each cluster take the bead nearest that cavity's own (interior-part)
+        centre that is INSIDE the protein envelope (concave-hull R* <= default probe), roomy
+        enough for CAVER (clearance >= probe) and BURIED (point_burial gate).
+        Clusters with no interior bead (surface grooves) are skipped. Largest clusters
         first, capped at max_seeds, and seeds within `dedupe` A of an already-kept one are dropped.
         Returns a list of {'local': (x, y, z), 'atom': n}; empty if none qualify."""
         clusters = ListObj(f'{prot_obj}Cl???????', format='OBJNUM')
         if not clusters:
             return []
-        all_g = np.array(PosAtom(f'Obj {prot_obj}Cl???????', coordsys='global')).reshape(-1, 3)
-        stree = None
-        try:
-            rs = np.array(PosAtom(f'Obj {prot_obj}roughsurf Element Du',
-                                  coordsys='global')).reshape(-1, 3)
-            if len(rs):
-                stree = cKDTree(rs)
-        except Exception:
-            stree = None
-        if stree is not None:
-            asurf = stree.query(all_g)[0]
-            depth_cut = float(asurf.min()) + 0.5 * (float(asurf.max()) - float(asurf.min()))
+        # Interior/burial signal comes from the concave-hull critical radius R* (stored in
+        # each bead's Property field by _precompute_hull_radius): a bead is interior if it
+        # lies inside the protein envelope at the default probe (R* <= HULL_DEFAULT_R). This
+        # replaces the old roughsurf surface-distance depth. Ensure R* is present (cached).
+        _precompute_hull_radius(prot_obj)
         pa = np.array(PosAtom(f'Obj {prot_obj} Res !HOH', coordsys='global')).reshape(-1, 3)
         prad = np.array(RadiusAtom(f'Obj {prot_obj} Res !HOH', Type='VdW'))
         ptree = cKDTree(pa)
@@ -1814,12 +1807,10 @@ def tunneler_dialog():
             cg = np.array(PosAtom(f'Obj {o}', coordsys='global')).reshape(-1, 3)
             if not len(cnums):
                 continue
-            if stree is not None:
-                di = np.where(stree.query(cg)[0] >= depth_cut)[0]
-            else:
-                di = np.arange(len(cnums))
+            interior = set(int(a) for a in ListAtom(f'Obj {o} and Property<={HULL_DEFAULT_R}'))
+            di = np.array([i for i, a in enumerate(cnums) if int(a) in interior], dtype=int)
             if not len(di):
-                continue                                  # surface / shallow cluster -> skip
+                continue                                  # no interior bead -> surface cluster, skip
             d, idx = ptree.query(cg[di], k=1)
             fit = (d - prad[idx]) >= probe
             pool = di[fit] if fit.any() else di
@@ -3029,7 +3020,6 @@ def tunneler_dialog():
                  prog=show_prog_var.get(),
                  progress_var=progress_var,
                  percent_label=percent_label,
-                 refined_surf_spacing=(1.0 if performant_mode_var.get() else 0.8),
                  performant_mode=performant_mode_var.get())
         progress_window.destroy()
 

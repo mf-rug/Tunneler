@@ -23,7 +23,6 @@ from yasara import DuplicateObj as y_DuplicateObj
 from yasara import DuplicateRes as y_DuplicateRes
 from yasara import DuplicateAtom as y_DuplicateAtom
 
-import itertools
 from configparser import ConfigParser
 import numpy as np
 from scipy.spatial import ConvexHull, Delaunay, cKDTree
@@ -33,12 +32,7 @@ from sklearn.cluster import DBSCAN
 #  CONSTANTS
 # ============================================================
 
-ROUGH_SURF_SPACING = 1.5        # Angstroms — grid spacing for the initial rough surface point cloud
 OBJECT_Z_OFFSET = -50           # Angstroms — Z offset to hide helper objects off-screen
-REFINED_SURF_SPACING = 0.6      # Angstroms — grid spacing for the refined surface representation
-SURFACE_REFINE_DISTANCE = 2.5   # Angstroms — max distance from accessible surface for refined points
-SURFACE_CONNECT_DISTANCE = 2.0  # Angstroms — flood-fill connectivity distance for surface shell
-SURFACE_BUFFER = 2.2            # Angstroms — buffer added when initializing surface distance threshold
 CIF_PREFILTER_MARGIN = 0.5     # Angstroms — over-inclusion margin for the interior-point prefilter (see _prefilter_inside_points)
 NEARBY_RESIDUE_DISTANCE = 4     # Angstroms — how close a residue must be to a tunnel to be included
 DBSCAN_EPS_FACTOR = 1.01        # Small factor to slightly enlarge DBSCAN epsilon
@@ -194,42 +188,6 @@ def is_float(value):
 #                  object renumbering
 # ============================================================
 
-def ml_outside_points(target, mode, by=0.5):
-    """Hide or show tunnel points near the protein surface (the 'surface points' slider).
-
-    Adjusts a distance threshold stored in the roughsurf object's Seg field,
-    then hides tunnel cluster points closer than that threshold to the accessible surface.
-
-    Args:
-        target: Object number of the protein target.
-        mode: 'less' to show fewer surface points, anything else to show more.
-        by: Step size in Angstroms for each adjustment.
-    """
-    Console("OFF")
-    cur_dist = SegObj(f'{target}roughsurf')[0]
-    if not is_float(cur_dist):
-        disto = ListAtom(f'obj {target}Cl??????? with minimum distance from obj {target}roughsurf')[0]
-        TransferObj(f'{target}roughsurf', ListObj(f'atom {disto}'))
-        cur_dist = Distance(disto, ListAtom(f'obj {target}roughsurf with minimum distance from atom {disto}'))[0] + SURFACE_BUFFER
-    else:
-        if mode == 'less':
-            cur_dist = float(cur_dist) + by
-        else:
-            cur_dist = float(cur_dist) - by
-    cur_dist = f'{cur_dist:.1f}'
-    SegObj(f'{target}roughsurf', cur_dist)
-    ShowObj(f'{target}Cl???????')
-    rough_surf = ListAtom(f'obj {target}roughsurf')
-    if stagen(stage) > stagen('View'):
-        surf_atom = FirstSurfAtom(rough_surf, 'accessible')[0]
-    else:
-        surf_atom = ListAtom(f'obj {target}roughsurf with maximum distance from obj {target}')
-        print('Warning: this command might give unexpected results because you are using the free version of Yasara.')
-
-    HideAtom(f'obj {target}Cl??????? with distance < {cur_dist} from accessible surface touched by {surf_atom}')
-    Console("ON")
-
-
 def sort_objs(target):
     """Renumber tunnel-related YASARA objects into a tidy consecutive sequence.
 
@@ -237,7 +195,7 @@ def sort_objs(target):
     cluster objects and their 'A' companions alternate (target+1, target+2, ...),
     followed by helper objects (polygons, surfaces, etc.).
     """
-    objs = ListObj(f'{target}Cl???????? {target}TPolygon? {target}Surf {target}CutPlane {target}roughsurf', format='OBJNUM')
+    objs = ListObj(f'{target}Cl???????? {target}TPolygon? {target}Surf {target}CutPlane', format='OBJNUM')
     objs_str = " ".join([str(x) for x in objs])
     free_from = list(reversed((ListObj('All', format='OBJNUM'))))[0]
     RenumberObj(objs_str, free_from + 1)
@@ -252,7 +210,7 @@ def sort_objs(target):
     for i, obj in enumerate(objs):
         RenumberObj(obj, target + (i * 2) + 2)
 
-    objs = ListObj(f'{target}TPolygon? {target}Surf {target}CutPlane {target}roughsurf', format='OBJNUM')
+    objs = ListObj(f'{target}TPolygon? {target}Surf {target}CutPlane', format='OBJNUM')
     objs_str = " ".join([str(x) for x in objs])
 
     RenumberObj(objs_str, list(reversed(ListObj(f'{target}Cl???????A', format='OBJNUM')))[0] + 1)
@@ -415,37 +373,6 @@ def get_shape_points(cube_points, hull_vertices):
     shape_points = cube_points[inside_mask]
     return(shape_points)
 
-def create_surrounding_points(points, spacing, remove_edge=True):
-    """Expand each point into a 3x3x3 neighborhood cube, then deduplicate.
-
-    Used to build the rough surface point cloud around protein atoms.
-    When remove_edge=True, only keeps neighbors that share at least one
-    coordinate with the original point (i.e. face/edge neighbors, not pure corners).
-
-    Vectorized (B3): the old per-point Python triple-loop + itertools.product
-    (~O(27N) in Python) is one numpy broadcast. Output is BYTE-IDENTICAL to the old
-    version, including the cross-axis quirk of the old ``any(item in point ...)`` edge
-    test -- a pure-corner neighbor is kept when a shifted coord happens to equal ANY
-    original coord, not just the same-axis one -- so the rough surface, and thus tunnel
-    detection, is unchanged (verified against the harness fingerprints).
-    """
-    pts = np.asarray(points, dtype=float)
-    if len(pts) == 0:
-        return np.unique(pts.reshape(-1, 3), axis=0)
-    offsets = np.array([0.0, -spacing, spacing])
-    # 27 offset combinations, same [0, -s, +s] per-axis order as the old itertools.product
-    combos = np.array(list(itertools.product(offsets, offsets, offsets)))   # (27, 3)
-    cand = pts[:, None, :] + combos[None, :, :]                             # (N, 27, 3)
-    if remove_edge:
-        # Keep a neighbour if any of its 3 coords equals any of its origin's 3 coords --
-        # reproduces the old cross-axis ``any(item in point for item in tup)`` exactly.
-        keep = (cand[:, :, :, None] == pts[:, None, None, :]).any(axis=(2, 3))   # (N, 27)
-        cand = cand[keep]
-    else:
-        cand = cand.reshape(-1, 3)
-    return np.unique(cand, axis=0)
-
-
 # ============================================================
 #  TUNNEL ANALYSIS PIPELINE
 #
@@ -492,11 +419,9 @@ def point_clouder(target, ball_spacing, ignore_surface, keep_surf_points, surf_c
     """Build a point cloud that fills the interior of the protein.
 
     Steps:
-      1. Get protein atom positions and create a rough surrounding grid (spacing 1.5 A).
-      2. Load that grid as a CIF into YASARA (the 'roughsurf' object, shifted Z-50 to hide it).
-      3. Get interior atoms (those buried deeper than ignore_surface from the accessible surface).
-      4. Compute convex hull of interior atoms; fill it with a fine grid (ball_spacing).
-      5. Keep only grid points inside the hull.
+      1. Get interior atoms (those buried deeper than ignore_surface from the accessible surface).
+      2. Compute convex hull of interior atoms; fill it with a fine grid (ball_spacing).
+      3. Keep only grid points inside the hull.
 
     If keep_surf_points is True, also computes an outer shell of points between two
     surface cutoffs — these are later used to prevent tunnels from connecting through
@@ -505,17 +430,6 @@ def point_clouder(target, ball_spacing, ignore_surface, keep_surf_points, surf_c
     Returns [outer_points, shape_points] where outer_points may be None.
     """
     Console("OFF")
-    pdb_points = PosAtom(f'obj {target}', coordsys='global')
-    pdb_points = np.array(pdb_points).reshape(-1, 3)
-    ddh_points = create_surrounding_points(pdb_points, ROUGH_SURF_SPACING)
-    ddh_points = np.unique(np.round(ddh_points, 0), axis=0)
-
-    ddh = load_cif_points(ddh_points, PWD() + os.path.sep + f'{target}roughsurf.cif', ori='right', center=False, correct=True, progress_cb=progress_cb)
-    MoveObj(ddh, z=OBJECT_Z_OFFSET)  # Shift off-screen so it doesn't interfere with the main view
-    StickObj(ddh)
-    ColorObj(ddh, 'white')
-    SwitchObj(ddh, 'off')
-
     if keep_surf_points:
         p1 = PosAtom(f'obj {target} with distance > {ignore_surface} from accessible surface of obj {target}', coordsys='global')
         if build_polygon:
@@ -714,7 +628,7 @@ def cluster_tunnel_points_dbscan(target, points, min_vol, ball_spacing, connect_
 
 def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball_protein=2.8,
              surf_con_prev=2.7, keep_surf_points=False, mds=0, min_vol=5, connect_cut=1, build_pol=True, prog='vis', progress_var=None,percent_label=None,
-             refined_surf_spacing=REFINED_SURF_SPACING, performant_mode=False):
+             performant_mode=False):
     """Run the full tunnel detection pipeline on a YASARA protein object.
 
     This is the main entry point called by the GUI. It orchestrates the entire
@@ -722,8 +636,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
 
     Optionally runs short MD simulations between iterations to sample flexibility.
 
-    After completion, creates a refined surface representation (roughsurf) and
-    saves the scene as '{name}_tunnels.sce'.
+    After completion, saves the scene as '{name}_tunnels.sce'.
 
     Args:
         target: YASARA object number of the protein to analyze.
@@ -740,8 +653,6 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
         prog: Progress display mode ('vis', 'fast', or 'wait').
         progress_var: Optional tkinter IntVar for progress bar updates.
         percent_label: Optional tkinter Label for percentage display.
-        refined_surf_spacing: Grid spacing (A) for the refined display surface (roughsurf).
-            Display-only; does not affect the detected tunnels.
         performant_mode: GUI compute-mode flag. Not used by detection itself; saved to the
             config so the Performant/Quality checkbox round-trips.
     """
@@ -803,7 +714,7 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
             print('Warning: Possibly unexpected visualization. An image was detected that cannot be deleted because you are using the free version of Yasara.')
         DelImage(1)
 
-    DelObj(f'{target}excluded {target}TPolygon? {target}Cl????????? {target}roughsurf {target}Close2Surf {target}tnlAAsurf {target}Close2Prot {target}Surf {target}SS {target}NonProt {target}H2O CenterHlp Du {target}excl_pts {target}CutPlane ???_shape ???_Sphere ???_sphere shpV??? shpA??? shpM??? sphT??? sphD??? CntrOfRot')
+    DelObj(f'{target}excluded {target}TPolygon? {target}Cl????????? {target}Close2Surf {target}tnlAAsurf {target}Close2Prot {target}Surf {target}SS {target}NonProt {target}H2O CenterHlp Du {target}excl_pts {target}CutPlane ???_shape ???_Sphere ???_sphere shpV??? shpA??? shpM??? sphT??? sphD??? CntrOfRot')
 
     # Create dummy objects to fill gaps in the object number list.
     # YASARA's RenumberObj needs consecutive slots; dummies are deleted at the end.
@@ -922,48 +833,15 @@ def Tunneler(target, ignore_res, ignore_surface=3.8, ball_spacing=0.33, max_ball
     # only (silent in 'fast'/'wait').
     if prog == 'vis':
         Wait(100)
-    # The clusters are done, but the (dominant) ~0.6A display-surface rebuild still runs
-    # below. Switch the hull off FIRST, then announce the real status via w() -- w() does
-    # ShowMessage + Wait(1), and it's the Wait(1) that actually repaints (a bare
-    # ShowMessage from this worker thread with the console off never redraws). w() also
-    # respects the prog mode; the '|   ' console spacer matches the other messages. The
-    # message persists through the surface build and is cleared at the true end.
+    # The clusters are done -- switch the tunnel hull polygons off for the final handover.
+    # (The old roughsurf display-surface rebuild used to run here; it was the dominant
+    # detection cost (~2.8s) and produced an always-hidden object, so it was removed. The
+    # Surface-points slider and CAVER seeding now use the numpy concave-hull instead.)
     SwitchObj(f'{str(target)}TPolygon?', 'off')
-    w('|   Finishing up: building surface...')
-
-    # --- Refine the rough surface representation ---
-    # Build a finer point cloud (0.6 A spacing) near the protein surface, then
-    # trim it to only keep points close to the accessible surface. This replaces
-    # the initial coarse roughsurf with a smoother version used for visualization.
-    tpoints = PosAtom(f'obj {target} with distance < {NEARBY_RESIDUE_DISTANCE} from accessible surface of obj {target}roughsurf', coordsys='global')
-    tpoints_hull_vertices, hull_simplices = get_hull(tpoints)
-    tpoints_cube_points = get_cube_points(tpoints_hull_vertices, refined_surf_spacing)
-    tpoints_shape_points = get_shape_points(tpoints_cube_points, tpoints_hull_vertices)
-    tpoints_outside_points = load_cif_points(tpoints_shape_points, PWD() + os.path.sep + f'{target}tpoints_shape_points.cif', correct=True, center=False, progress_cb=_band(90, 98))[0]
-    MoveObj(tpoints_outside_points,z=OBJECT_Z_OFFSET)
-    # Keep only points within SURFACE_REFINE_DISTANCE of the protein's accessible surface
-    DelAtom(f'obj {tpoints_outside_points} with distance > {SURFACE_REFINE_DISTANCE} from accessible surface of obj {target}')
-    # Keep only the connected surface shell (flood-fill from one surface atom)
-    a = FirstSurfAtom(f'obj {tpoints_outside_points}', 'accessible')[0]
-    DelAtom(f'obj {tpoints_outside_points} with distance > {SURFACE_CONNECT_DISTANCE} from accessible surface touched by {a}')
-    # Replace the old roughsurf with this refined version
-    n = ListObj(f'{target}roughsurf', format='OBJNUM')[0]
-    HideObj(tpoints_outside_points)
-    DelObj(f'{target}roughsurf')
-    NameObj(f'{tpoints_outside_points}', f'{target}roughsurf')
-    RenumberObj(f'{target}roughsurf', n)
-    # Add backbone atoms to roughsurf for better surface rendering
-    tar = DuplicateObj(target)[0]
-    DelAtom(f'obj {tar} atom !backbone')
-    JoinObj(tar, f'{target}roughsurf')
 
     _prog(99)
-
-    ShowSurfRes(f'obj {target}roughsurf element Du', 'accessible',outcol='blue', outalpha=50,incol='red',inalpha=50)
-    HideObj(f'{target}roughsurf')
-    SwitchObj(f'{target}roughsurf', 'off')
-    SwitchObj('cutplane','off')
-    HideMessage()   # display surface built -> clear the "finishing up" status; final handover
+    SwitchObj('cutplane', 'off')
+    HideMessage()   # clear any lingering status message -> final handover
 
     # transfer and fix ss in 'A' objs
     transf_and_fix_ss(target)
