@@ -4438,7 +4438,6 @@ def tunneler_dialog():
     load_menu = tk.Menu(root, tearoff=0)
     load_menu.add_command(label='Tunneler scene…', command=load_tunneler_scene)
     load_menu.add_separator()
-    load_menu.add_command(label='CAVER settings…', command=run_caver_dialog)
     load_menu.add_command(label='Import CAVER output…', command=import_caver)
 
     # Compact icon buttons (folder = Load, floppy = Save) so the row fits beside the
