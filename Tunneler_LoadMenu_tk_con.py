@@ -748,12 +748,26 @@ def _union_shape_mesh(centers, colors, radius, alpha, voxel=0.3, smooth=0.8,
         verts, faces, norms = cached[1], cached[2], cached[3]   # reuse cached marching-cubes geometry
     else:
         from skimage import measure                       # in the venv; imported lazily
-        margin = radius + 2 * voxel
+        # `radius` may be a scalar (uniform "sausage") or a per-centre array (variable, thickness-
+        # preserving). Uniform: SDF = dist-to-nearest-centre - radius. Variable: the union of balls
+        # with per-bead radii = min_i(dist_i - r_i); evaluated over the K nearest centres (a farther
+        # but larger bead can still own a point, so K>1), which follows the true bottlenecks/bulges.
+        radii_arr = np.asarray(radius, float)
+        variable = radii_arr.ndim > 0
+        rmax = float(radii_arr.max()) if variable else float(radii_arr)
+        margin = rmax + 2 * voxel
         lo = centers.min(0) - margin; hi = centers.max(0) + margin
         ax = [np.arange(lo[d], hi[d], voxel) for d in range(3)]
         gx, gy, gz = np.meshgrid(*ax, indexing='ij')
         pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
-        sdf = (cKDTree(centers).query(pts)[0] - radius).reshape(gx.shape)
+        if variable:
+            K = min(len(centers), 12)
+            dK, iK = cKDTree(centers).query(pts, k=K)
+            if K == 1:
+                dK = dK[:, None]; iK = iK[:, None]
+            sdf = (dK - radii_arr[iK]).min(axis=1).reshape(gx.shape)
+        else:
+            sdf = (cKDTree(centers).query(pts)[0] - float(radii_arr)).reshape(gx.shape)
         if smooth > 0:
             from scipy.ndimage import gaussian_filter
             sdf = gaussian_filter(sdf, smooth)
@@ -1278,14 +1292,24 @@ def tunneler_dialog():
         mols = []
         n = len(tunnel_pdbs)
 
-        def _load_tunnels_into(base):
+        def _load_tunnels_into(base, frame_obj=None):
             """Load every tunnel PDB (center=False keeps CAVER's frame), colour by hue, rename
             its molecule tA/tB..., and join into `base` (or become `base` if it's None). Returns
-            the base object number."""
+            the base object number.
+
+            When `frame_obj` is given, stamp that object's transform onto EACH tunnel object
+            *before* joining. LoadPDB(center=False) gives each loaded object its own transform,
+            and JoinObj re-expresses the merged atoms in the FIRST object's frame -- so applying a
+            single PosOriObj to the joined result only lands the first cluster and misplaces the
+            rest by several A (they then miss the start point / don't overlay). Overlaying each
+            object first means all share one frame, and JoinObj preserves it."""
+            po = PosOriObj(frame_obj) if frame_obj is not None else None
             for i, pdb in enumerate(tunnel_pdbs):
                 ShowMessage(f'Loading CAVER tunnel {i + 1} / {n}')
                 tun = LoadPDB(pdb, center=False, correct=False)[0]
                 ColorObj(tun, int(360 / n * i))
+                if po is not None:
+                    PosOriObj(tun, po[0], po[1], po[2], po[3], po[4], po[5])
                 molname = 't' + alphabet[i % len(alphabet)]
                 NameMol(f'obj {tun}', molname)
                 mols.append(molname)
@@ -1299,9 +1323,7 @@ def tunneler_dialog():
 
         if frame_obj is not None:
             # Place the tunnels straight into the original structure's frame -- no input copy.
-            prot = _load_tunnels_into(None)
-            po = PosOriObj(frame_obj)                    # x, y, z, alpha, beta, gamma
-            PosOriObj(prot, po[0], po[1], po[2], po[3], po[4], po[5])
+            prot = _load_tunnels_into(None, frame_obj=frame_obj)
             NameObj(prot, 'caver')
         else:
             # Manual Import: no original in the scene, so load CAVER's own input copy as the base
@@ -1431,349 +1453,479 @@ def tunneler_dialog():
 
         root.after(300, _check)
 
-    def run_caver_dialog():
-        """Configure and run CAVER on the currently selected structure, then auto-import its
-        tunnels. v1: requires an installed Java; user picks a starting point from the YASARA
-        selection (or the protein centroid); a handful of key params; runs headless."""
-        m = re.findall(r"\d+(?=:)", target_option.get())
-        if not m:
-            _caver_msg("Pick a structure in the 'Predict' tab first.")
-            return
-        prot_obj = m[0]
+    # Last-used CAVER parameters, shared between the Run-CAVER dialog and the tab-1
+    # "Also run CAVER" auto-run. The dialog seeds its widgets from here and writes back on
+    # Run, so the checkbox fires CAVER with whatever the dialog last used (or these defaults
+    # if the dialog was never opened). Start point is NOT stored here -- the auto-run always
+    # seeds from the freshly detected tunnels; the dialog resolves its own interactive pick.
+    caver_cfg = {'probe': 0.9, 'shell_r': 3, 'shell_d': 4, 'clust': 3.5,
+                 'max_dist': 3, 'snap': True,
+                 'seed_tunnels': True, 'seed_marked': False, 'seed_centroid': False,
+                 'seed_separate': False}
 
-        if not caver.find_java():
-            messagebox.showwarning(
-                'Java not found',
-                'CAVER needs a Java runtime, which was not found on your PATH.\n\n'
-                'Install a JRE (e.g. from adoptium.net) and try again.', parent=root)
-            return
+    def _caver_run_multi(prot_obj, seeds, probe, shell_r, shell_d, clust,
+                         exclude_items=(), frame_objs=None):
+        """Launch one CAVER run per seed (CAVER takes a single origin per run), all sharing one
+        input dir written once. Each seed carries its own 'max_dist' (CAVER start-walk leash).
+        Returns a list of (proc, out_dir), or None if no CAVER home."""
         home = _resolve_caver_home()
         if not home:
-            return
+            return None
+        run_dir = tempfile.mkdtemp(prefix='tunneler_caver_')
+        in_dir = os.path.join(run_dir, 'input')
+        os.makedirs(in_dir)
+        Console("OFF")
+        objs = list(frame_objs) if frame_objs else [prot_obj]
+        for i, obj in enumerate(objs):
+            dup = DuplicateObj(obj)[0]
+            DelRes(f'Obj {dup} Res HOH')
+            if frame_objs:
+                DelAtom(f'Obj {dup} Element H')
+            for item in exclude_items:
+                DelRes(f'Obj {dup} Res {item}')
+            fname = f'frame_{i + 1:04d}.pdb' if frame_objs else 'structure.pdb'
+            SavePDB(f'Obj {dup}', os.path.join(in_dir, fname), transform='No')
+            DelObj(dup)
+        Console("hidden")
+        runs = []
+        for k, s in enumerate(seeds):
+            lx, ly, lz = s['local']
+            xyz = (-lx, ly, lz)                            # CAVER frame = local, X negated
+            out_dir = os.path.join(run_dir, f'out{k + 1}')
+            cfg_path = os.path.join(run_dir, f'config{k + 1}.txt')
+            md = s.get('max_dist', min(float(caver_cfg['max_dist']), 1.0))
+            with open(cfg_path, 'w') as f:
+                f.write(caver.make_config(xyz, probe_radius=probe, shell_radius=shell_r,
+                                          shell_depth=shell_d, clustering_threshold=clust,
+                                          max_distance=md))
+            runs.append((caver.start_caver(caver.find_java(), home, in_dir, cfg_path, out_dir),
+                         out_dir))
+        return runs
 
+    def _poll_caver_multi(runs, frame_obj=None):
+        """Poll several CAVER runs (one per seed) and, once ALL have exited, merge-import the
+        tunnels from every run that produced any. Non-blocking (root.after)."""
+        pw = tk.Toplevel(root)
+        pw.title('Running CAVER')
+        pw.attributes('-topmost', True)
+        ttk.Label(pw, text=f'Running CAVER ({len(runs)} seeds)…').pack(padx=25, pady=(15, 5))
+        pb = ttk.Progressbar(pw, mode='indeterminate', length=220)
+        pb.pack(padx=25, pady=(0, 15))
+        pb.start(12)
+
+        def _check():
+            if any(proc.poll() is None for proc, _ in runs):
+                root.after(300, _check)
+                return
+            pb.stop()
+            pw.destroy()
+            good = [od for proc, od in runs
+                    if proc.returncode == 0 and caver.find_clusters_timeless(od) is not None]
+            if not good:
+                _caver_msg('CAVER found no tunnels from any seed.', secs=120)
+                return
+            if caver_cfg.get('seed_separate'):
+                _import_caver_separate(good, frame_obj=frame_obj)
+            else:
+                _import_caver_multi(good, frame_obj=frame_obj)
+
+        root.after(300, _check)
+
+    def _caver_dedupe_tunnels(pdbs, dist=1.5, frac=0.85):
+        """Drop near-duplicate tunnels that different seeds found for the same physical path.
+        All tunnel PDBs come from the same CAVER input, so their bead coordinates are directly
+        comparable. Longest tunnel first; a candidate is dropped when `frac` of its beads lie
+        within `dist` A of an already-kept tunnel (i.e. it is essentially contained in one we
+        already have). Genuinely distinct or only-partially-overlapping tunnels survive. Returns
+        (kept_pdbs, n_dropped)."""
+        loaded = []
+        for pdb in pdbs:
+            pts = []
+            with open(pdb) as f:
+                for l in f:
+                    if l.startswith(('ATOM', 'HETATM')):
+                        pts.append((float(l[30:38]), float(l[38:46]), float(l[46:54])))
+            if pts:
+                loaded.append((pdb, np.array(pts)))
+        kept, kept_trees = [], []
+        for pdb, pts in sorted(loaded, key=lambda t: len(t[1]), reverse=True):  # longest first
+            if any((tree.query(pts)[0] <= dist).mean() >= frac for tree in kept_trees):
+                continue                                  # essentially contained in a kept tunnel
+            kept.append(pdb)
+            kept_trees.append(cKDTree(pts))
+        return kept, len(loaded) - len(kept)
+
+    def _import_caver_multi(out_dirs, frame_obj=None):
+        """Merge the tunnels from several CAVER runs (one per seed) into a single 'caver' object,
+        after dropping near-duplicate tunnels that different seeds found for the same path.
+
+        Each tunnel is stamped into frame_obj's frame BEFORE joining (see the overlay note in
+        _load_tunnels_into -- JoinObj re-expresses atoms in the first object's frame, so a single
+        post-hoc PosOriObj would misplace all but the first). Molecules get unique 2-letter names
+        so the Caver tab can colour/handle each tunnel individually. Returns True on success."""
+        pdbs = []
+        for od in out_dirs:
+            for dp, _d, _f in os.walk(od):
+                if os.path.basename(dp) == 'clusters_timeless':
+                    pdbs += sorted(os.path.join(dp, f) for f in os.listdir(dp)
+                                   if f.lower().endswith('.pdb'))
+                    break
+        if not pdbs:
+            _caver_msg('No tunnels to import.')
+            return False
+        pdbs, n_dropped = _caver_dedupe_tunnels(pdbs)
+        Console("OFF")
+        az = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        po = PosOriObj(frame_obj) if frame_obj is not None else None
+        n = len(pdbs)
+        base = None
+        for mi, pdb in enumerate(pdbs):
+            tun = LoadPDB(pdb, center=False, correct=False)[0]
+            ColorObj(tun, int(360 / n * mi))
+            if po is not None:
+                PosOriObj(tun, po[0], po[1], po[2], po[3], po[4], po[5])
+            NameMol(f'obj {tun}', az[mi // 26 % 26] + az[mi % 26])   # unique 2-letter name
+            base = tun if base is None else (JoinObj(tun, base) or base)
+        NameObj(base, 'caver')
+        HideObj(base)
+        Console("hidden")
+        if n_dropped:
+            ShowMessage(f'Merged {n} CAVER tunnels from {len(out_dirs)} seeds '
+                        f'({n_dropped} duplicates removed)'); Wait(30); HideMessage()
+        _reveal_caver_tab()
+        _redraw_caver()
+        return True
+
+    def _import_caver_separate(out_dirs, frame_obj=None):
+        """Inspection mode: import each seed's tunnels as its OWN object (caver_s1, caver_s2, ...),
+        one hue per seed, shown as ball-and-stick. No dedup, no merge -- so overlap between seeds
+        is directly visible by toggling objects. Each tunnel is stamped into frame_obj's frame
+        before joining within its seed. The Caver tab (which drives the merged 'caver' object) is
+        left alone."""
+        Console("OFF")
+        po = PosOriObj(frame_obj) if frame_obj is not None else None
+        n = len(out_dirs)
+        made = []
+        for si, od in enumerate(out_dirs):
+            cdir = None
+            for dp, _d, _f in os.walk(od):
+                if os.path.basename(dp) == 'clusters_timeless':
+                    cdir = dp
+                    break
+            if cdir is None:
+                continue
+            base = None
+            for pdb in sorted(os.path.join(cdir, f) for f in os.listdir(cdir)
+                              if f.lower().endswith('.pdb')):
+                tun = LoadPDB(pdb, center=False, correct=False)[0]
+                if po is not None:
+                    PosOriObj(tun, po[0], po[1], po[2], po[3], po[4], po[5])
+                base = tun if base is None else (JoinObj(tun, base) or base)
+            if base is None:
+                continue
+            ColorObj(base, int(360 / max(n, 1) * si))     # one hue per seed
+            NameObj(base, f'caver_s{si + 1}')
+            BallStickObj(base)
+            made.append(f'caver_s{si + 1}')
+        Console("hidden")
+        ShowMessage(f'Imported {len(made)} per-seed CAVER objects: {" ".join(made)} '
+                    '(toggle in the object list to inspect overlap)'); Wait(50); HideMessage()
+        return True
+
+    def _caver_md_frames(prot_obj):
+        """Object numbers for a trajectory CAVER run seeded from a Find-tunnels(mds>0) run:
+        [prot_obj, MD1_*, MD2_*, ...] in frame order, or None when no MD frames are present
+        (mds was 0). The MD conformations are the 'MD{n}_{name}' objects Tunneler leaves behind
+        (switched off); frame 1 is the original structure so the seed/overlay frame matches."""
+        md = []
+        for entry in ListObj('all', format='OBJNUM: OBJNAME'):
+            num, name = entry.split(': ', 1)
+            m = re.match(r'^MD(\d+)_', name)
+            if m:
+                md.append((int(m.group(1)), int(num)))
+        if not md:
+            return None
+        md.sort()
+        return [int(prot_obj)] + [num for _, num in md]
+
+    def _prot_local_to_global(prot_obj, lx, ly, lz):
+        """Global coords of a point given in prot_obj's LOCAL frame (inverse of
+        _global_to_prot_local). Borrows the object transform via a throwaway duplicate."""
+        dup = DuplicateObj(prot_obj)[0]
+        a0 = ListAtom(f'Obj {dup}')[0]
+        PosAtom(f'Atom {a0}', lx, ly, lz, coordsys='local')
+        g = PosAtom(f'Atom {a0}', coordsys='global')
+        DelObj(dup)
+        return (g[0], g[1], g[2])
+
+    def _resolve_caver_seeds(prot_obj):
+        """Build the CAVER seed list from the sources ticked in caver_cfg (their UNION), each with
+        a per-seed 'max_dist' (CAVER's own start-walk leash). Tunneler-cluster seeds are already
+        centred in their cavity -> kept on a short leash. Marked-atom / Centroid picks are snapped
+        into the nearest buried cavity when Auto-snap is on (then short leash); unsnapped they get
+        the full Start-search value so CAVER can still walk in. Near-coincident seeds (<2 A) are
+        de-duplicated. Returns a list of {'local': (x,y,z), 'atom': n-or-None, 'max_dist': d}."""
+        tight = min(float(caver_cfg['max_dist']), 1.0)
+        full = float(caver_cfg['max_dist'])
+        seeds = []
+        if caver_cfg.get('seed_tunnels', True):
+            for s in _caver_seeds_from_tunnels(prot_obj):
+                s['max_dist'] = tight
+                seeds.append(s)
+        manual = []
+        if caver_cfg.get('seed_marked'):
+            marked = [a for a in MarkAtom() if a]
+            if marked:
+                g = PosAtom('Atom ' + ' '.join(str(a) for a in marked), coordsys='global')
+                k = len(marked)
+                gx, gy, gz = sum(g[0::3]) / k, sum(g[1::3]) / k, sum(g[2::3]) / k
+                lx, ly, lz = _global_to_prot_local(prot_obj, gx, gy, gz)
+                manual.append({'local': (lx, ly, lz), 'atom': marked[0]})
+        if caver_cfg.get('seed_centroid'):
+            lo = PosAtom(f'Obj {prot_obj} Res !HOH', coordsys='local', mean='Yes')
+            manual.append({'local': (lo[0], lo[1], lo[2]), 'atom': None})
+        if manual:
+            snap = caver_cfg.get('snap', True)
+            pa = PosAtom(f'Obj {prot_obj} Res !HOH', coordsys='local')
+            rad = RadiusAtom(f'Obj {prot_obj} Res !HOH', Type='VdW')
+            atoms_local = [(pa[i], pa[i + 1], pa[i + 2], rad[i // 3]) for i in range(0, len(pa), 3)]
+            for s in manual:
+                if snap:
+                    rep = caver.snap_start_point(s['local'], atoms_local, max_step=full, burial_min=0.6)
+                    s['local'] = rep['snapped']
+                    s['max_dist'] = tight
+                else:
+                    s['max_dist'] = full
+                seeds.append(s)
+        uniq = []
+        for s in seeds:
+            p = np.array(s['local'])
+            if any(np.linalg.norm(p - np.array(u['local'])) < 2.0 for u in uniq):
+                continue
+            uniq.append(s)
+        return uniq
+
+    def _caver_debug_seed_preview(prot_obj, seeds):
+        """Debug breakpoint (Debug-Wait mode): dress the scene so the resolved CAVER seed(s) can be
+        eyeballed, then block on Continue. Protein -> white ribbon only; every tunnel cluster
+        coloured by cluster; a magenta ball at each seed (its LOCAL point converted fresh to
+        global, so it lands correctly). Lets you see where CAVER will be seeded before it runs."""
+        Console("OFF")
+        try:
+            ColorObj(prot_obj, 'White')
+            ShowSecStrObj(prot_obj, 'Ribbon', hideatoms='Yes')
+            for i, o in enumerate(ListObj(f'{prot_obj}Cl???????', format='OBJNUM')):
+                ShowObj(o)
+                ColorObj(o, (i + 1) * 25)          # colour by cluster (same hue step Tunneler uses)
+            for s in seeds:
+                gx, gy, gz = _prot_local_to_global(prot_obj, *s['local'])
+                sp = ShowSphere(radius=1.4, color='ff00ff', alpha=100, level=2)
+                PosObj(sp, gx, gy, gz)
+                NameObj(sp, 'CavSeed')
+            ShowMessage(f'DEBUG: {len(seeds)} magenta seed(s).  Continue to run CAVER.')
+        finally:
+            Console("hidden")
+        Wait('Continuebutton')
+        Console("OFF")
+        try:
+            DelObj('Obj CavSeed')          # markers cleared before the tunnels come in
+        except Exception:
+            pass
+        HideMessage()
+        Console("hidden")
+
+    def _run_caver_after_detection(prot_obj, mds, debug=False):
+        """The tab-1 'Also run CAVER' path: resolve the seed set from the ticked sources
+        (Tunneler cavities / marked atom / centroid), add the MD conformations as trajectory
+        frames when mds>0, launch a run per seed, then merge-import. Non-blocking. Residue
+        exclusion always follows the Predict tab's Exclude list. Bails (YASARA message) if there
+        is no usable seed or no Java. debug=True inserts the eyeball breakpoint first."""
+        seeds = _resolve_caver_seeds(prot_obj)
+        if not seeds:
+            ShowMessage('Also-run CAVER: no seed available (mark an atom, or Find tunnels first) '
+                        '-- skipped.'); Wait(1)
+            return
+        if not caver.find_java():
+            ShowMessage('Also-run CAVER: no Java runtime found -- skipped.'); Wait(1)
+            return
+        if debug:
+            _caver_debug_seed_preview(prot_obj, seeds)
+        frame_objs = _caver_md_frames(prot_obj) if mds > 0 else None
+        # Exclusion always mirrors the Predict tab's selection so the two never diverge.
+        exclude_items = [listbox.get(i) for i in listbox.curselection()]
+        runs = _caver_run_multi(prot_obj, seeds, caver_cfg['probe'], caver_cfg['shell_r'],
+                                caver_cfg['shell_d'], caver_cfg['clust'],
+                                exclude_items=exclude_items, frame_objs=frame_objs)
+        if runs:
+            _poll_caver_multi(runs, frame_obj=prot_obj)
+
+    def _global_to_prot_local(prot_obj, gx, gy, gz):
+        """Protein-LOCAL coords of a GLOBAL point. Tunnel-cluster objects each get their own
+        centred local frame (CenterAtom during clustering), so bead positions are gathered in the
+        shared global frame and the chosen point is converted back into prot_obj's local frame
+        here (the CAVER config then negates X). YASARA has no bare-coordinate transform, so borrow
+        the object transform via a throwaway duplicate: park a dummy atom at the global point, read
+        its local, discard the copy."""
+        dup = DuplicateObj(prot_obj)[0]
+        a0 = ListAtom(f'Obj {dup}')[0]
+        PosAtom(f'Atom {a0}', gx, gy, gz, coordsys='global')
+        lo = PosAtom(f'Atom {a0}', coordsys='local')
+        DelObj(dup)
+        return (lo[0], lo[1], lo[2])
+
+    def _caver_seeds_from_tunnels(prot_obj, max_seeds=5, dedupe=5.0):
+        """ONE CAVER seed per significant Tunneler cavity, for the multi-seed auto-run.
+
+        Rationale: CAVER from a single interior point only reaches what's connected to it, so a
+        lone seed misses disconnected cavities (e.g. a central channel vs an off-centre subdomain
+        pocket). Tunneler's clusters already ARE the distinct cavity systems, so we seed one per
+        cluster: within each cluster take the bead nearest that cavity's own (deep-part) centre
+        that is deep below the surface, roomy enough for CAVER (clearance >= probe) and BURIED.
+        Clusters with no such bead (surface grooves / too shallow) are skipped. Largest clusters
+        first, capped at max_seeds, and seeds within `dedupe` A of an already-kept one are dropped.
+        Returns a list of {'local': (x, y, z), 'atom': n}; empty if none qualify."""
+        clusters = ListObj(f'{prot_obj}Cl???????', format='OBJNUM')
+        if not clusters:
+            return []
+        all_g = np.array(PosAtom(f'Obj {prot_obj}Cl???????', coordsys='global')).reshape(-1, 3)
+        stree = None
+        try:
+            rs = np.array(PosAtom(f'Obj {prot_obj}roughsurf Element Du',
+                                  coordsys='global')).reshape(-1, 3)
+            if len(rs):
+                stree = cKDTree(rs)
+        except Exception:
+            stree = None
+        if stree is not None:
+            asurf = stree.query(all_g)[0]
+            depth_cut = float(asurf.min()) + 0.5 * (float(asurf.max()) - float(asurf.min()))
+        pa = np.array(PosAtom(f'Obj {prot_obj} Res !HOH', coordsys='global')).reshape(-1, 3)
+        prad = np.array(RadiusAtom(f'Obj {prot_obj} Res !HOH', Type='VdW'))
+        ptree = cKDTree(pa)
+        atoms = [(pa[j, 0], pa[j, 1], pa[j, 2], prad[j]) for j in range(len(pa))]
+        dirs = caver._sphere_directions(32)
+        probe = float(caver_cfg.get('probe', 0.9))
+        seeds, kept_g = [], []
+        for o in sorted(clusters, key=lambda o: CountAtom(f'Obj {o}'), reverse=True):
+            if len(seeds) >= max_seeds:
+                break
+            cnums = np.array(ListAtom(f'Obj {o}', format='ATOMNUM'))
+            cg = np.array(PosAtom(f'Obj {o}', coordsys='global')).reshape(-1, 3)
+            if not len(cnums):
+                continue
+            if stree is not None:
+                di = np.where(stree.query(cg)[0] >= depth_cut)[0]
+            else:
+                di = np.arange(len(cnums))
+            if not len(di):
+                continue                                  # surface / shallow cluster -> skip
+            d, idx = ptree.query(cg[di], k=1)
+            fit = (d - prad[idx]) >= probe
+            pool = di[fit] if fit.any() else di
+            ccentre = cg[di].mean(0)                       # centre of this cavity's deep part
+            order = pool[np.argsort(np.linalg.norm(cg[pool] - ccentre, axis=1))]
+            chosen = int(order[0])
+            for j in order[:60]:
+                if caver.point_burial(tuple(cg[j]), atoms, dirs) >= 0.7:
+                    chosen = int(j)
+                    break
+            g = cg[chosen]
+            if any(np.linalg.norm(g - kg) < dedupe for kg in kept_g):
+                continue                                  # same spot as an already-kept seed
+            lx, ly, lz = _global_to_prot_local(prot_obj, float(g[0]), float(g[1]), float(g[2]))
+            seeds.append({'local': (lx, ly, lz), 'atom': int(cnums[chosen])})
+            kept_g.append(g)
+        return seeds
+
+    def run_caver_dialog(anchor_widget=None):
+        """CAVER settings for the tab-1 'Also run CAVER' auto-run. Pick which start-point
+        source(s) to seed CAVER from -- the checkboxes are ADDITIVE, so the seed set is their
+        union (e.g. one seed per Tunneler cavity PLUS a marked atom). Auto-snap nudges the manual
+        picks into the nearest buried cavity. OK stores everything in caver_cfg; the run itself is
+        triggered by the 'Also run CAVER' checkbox during Find tunnels. Residue exclusion is NOT
+        set here -- CAVER always drops whatever is selected in the Predict tab's 'Exclude
+        residues' list, so the two can never diverge."""
         win = tk.Toplevel(root)
-        win.title('Run CAVER')
+        win.title('CAVER settings')
         win.attributes('-topmost', True)
         win.resizable(False, False)
 
-        ttk.Label(win, text=f'Structure:  {NameObj(prot_obj)[0]} (obj {prot_obj})',
-                  font='TkSmallCaptionFont').grid(row=0, column=0, columnspan=4, sticky='w',
-                                                  padx=5, pady=(5, 2))
+        r = 0
+        ttk.Label(win, text='Seed CAVER from (any combination):').grid(
+            row=r, column=0, columnspan=2, sticky='w', padx=5, pady=(6, 2))
+        r += 1
+        v_tun = tk.BooleanVar(value=caver_cfg.get('seed_tunnels', True))
+        v_mark = tk.BooleanVar(value=caver_cfg.get('seed_marked', False))
+        v_cent = tk.BooleanVar(value=caver_cfg.get('seed_centroid', False))
+        ttk.Checkbutton(win, text='Tunneler clusters  (one seed per cavity)',
+                        variable=v_tun).grid(row=r, column=0, columnspan=2, sticky='w', padx=16)
+        r += 1
+        ttk.Checkbutton(win, text='Marked atom',
+                        variable=v_mark).grid(row=r, column=0, columnspan=2, sticky='w', padx=16)
+        r += 1
+        ttk.Checkbutton(win, text='Centroid',
+                        variable=v_cent).grid(row=r, column=0, columnspan=2, sticky='w', padx=16)
+        r += 1
 
-        # start_point carries the picked start across the widgets and the run. Everything is
-        # kept in view-independent LOCAL coords; 'global' is camera-relative and would go stale
-        # the moment the scene is rotated/zoomed. Keys: raw_local/snap_local -- the pick and the
-        # burial-snapped point in the object's local frame; raw_caver/snap_caver -- the same two
-        # with X negated (the CAVER/SavePDB(transform='No') frame, used for the config); diag --
-        # the snap_start_point() report; preview -- the YASARA marker objects.
-        start_point = {'raw_caver': None}
-        atoms_cache = {}
+        v_snap = tk.BooleanVar(value=caver_cfg.get('snap', True))
+        snap_chk = ttk.Checkbutton(win, text='Auto-snap manual picks into cavity', variable=v_snap)
+        snap_chk.grid(row=r, column=0, columnspan=2, sticky='w', padx=5, pady=(6, 2))
+        r += 1
+        create_tooltip(snap_chk,
+                       'Nudge the Marked-atom / Centroid seed toward the roomiest nearby\n'
+                       'BURIED spot before running, so a click near a pocket still lands\n'
+                       'inside it. Tunneler-cluster seeds are already interior, so snap is\n'
+                       'not applied to them.')
 
-        def _protein_atoms_local():
-            """(x, y, z, vdW) for every non-water atom of the target, in the object's LOCAL
-            frame -- the atom set the snap climbs over. Local coords are glued to the structure,
-            unlike 'global' which is camera-relative (0/0/0 = window centre) and shifts on every
-            zoom/rotate; so this cache stays valid and the snap is immune to view changes."""
-            if 'a' not in atoms_cache:
-                s = f'Obj {prot_obj} Res !HOH'
-                p = PosAtom(s, coordsys='local')
-                rad = RadiusAtom(s, Type='VdW')
-                atoms_cache['a'] = [(p[i], p[i + 1], p[i + 2], rad[i // 3])
-                                    for i in range(0, len(p), 3)]
-            return atoms_cache['a']
+        v_sep = tk.BooleanVar(value=caver_cfg.get('seed_separate', False))
+        sep_chk = ttk.Checkbutton(win, text='Keep each seed as a separate object', variable=v_sep)
+        sep_chk.grid(row=r, column=0, columnspan=2, sticky='w', padx=5, pady=(0, 2))
+        r += 1
+        create_tooltip(sep_chk,
+                       'Import each seed\'s tunnels as its own coloured object (caver_s1,\n'
+                       'caver_s2, ...) instead of merging + de-duplicating into one "caver"\n'
+                       'object. Lets you toggle seeds in the object list to inspect overlap.')
 
-        def _local_to_global(lx, ly, lz):
-            """Global (screen) coords of a LOCAL point, computed FRESH for the current view --
-            needed only to place the preview spheres, which live in the global frame. YASARA has
-            no bare-coordinate transform, so borrow the object transform via a throwaway
-            duplicate: park its first atom at the local point, read the atom's global coords,
-            discard the copy. Done at draw time so the markers land correctly wherever the camera
-            is now; once placed, a sphere is a scene object and tracks the structure afterwards."""
-            dup = DuplicateObj(prot_obj)[0]
-            a0 = ListAtom(f'Obj {dup}')[0]
-            PosAtom(f'Atom {a0}', lx, ly, lz, coordsys='local')
-            g = PosAtom(f'Atom {a0}', coordsys='global')
-            DelObj(dup)
-            return (g[0], g[1], g[2])
-
-        def _snap_leash():
-            try:
-                return max(float(pvars['max_dist'].get()), 0.1)
-            except (ValueError, KeyError):
-                return 3.0
-
-        def _compute_snap(pick_local):
-            """Burial-constrained snap of a LOCAL pick; the returned report's 'snapped' point is
-            also in the local frame (clearance/burial are distances, so frame doesn't matter)."""
-            return caver.snap_start_point(pick_local, _protein_atoms_local(),
-                                          max_step=_snap_leash(), burial_min=0.6)
-
-        def _clear_preview():
-            # Preview markers are named 'TnlSnap'; delete by name so shifting object numbers
-            # can't make us remove the wrong object. No-op (silently) if none are present.
-            try:
-                DelObj('Obj TnlSnap')
-            except Exception:
-                pass
-            start_point['preview'] = []
-
-        def _draw_preview(pick_local, snap_local, diag):
-            """Magenta ball = your click; yellow ball = where it snaps; translucent yellow =
-            the open space found; orange arrow = the move. Inputs are LOCAL points, converted to
-            global here (fresh, current view) so the markers land on the structure no matter how
-            the scene is currently rotated or zoomed."""
-            _clear_preview()
-            try:
-                px, py, pz = _local_to_global(*pick_local)
-                click = ShowSphere(radius=0.5, color='ff00ff', alpha=100, level=2)
-                PosObj(click, px, py, pz); NameObj(click, 'TnlSnap')
-                if snap_local is not None:
-                    sx, sy, sz = _local_to_global(*snap_local)
-                    if diag and diag['clearance'] > 0:
-                        void = ShowSphere(radius=diag['clearance'], color='ffff00', alpha=20, level=2)
-                        PosObj(void, sx, sy, sz); NameObj(void, 'TnlSnap')
-                    snp = ShowSphere(radius=0.5, color='ffff00', alpha=100, level=2)
-                    PosObj(snp, sx, sy, sz); NameObj(snp, 'TnlSnap')
-                    arrow = ShowArrow2('Point', px, py, pz, 'Point', sx, sy, sz,
-                                       radius=0.12, heads=1, color='ff8000')
-                    NameObj(arrow, 'TnlSnap')  # so _clear_preview() removes it too
-            except Exception:
-                pass
-
-        # Starting point -------------------------------------------------------
-        # row 1: "Start point" + the two source buttons, all in one left-packed frame so the
-        # buttons hug the label and don't inherit the (wider) parameter column widths.
-        # row 2: one shared status line.
-        status_lbl = ttk.Label(win, text='mark an atom, or use center of gravity', foreground='#555')
-        status_lbl.grid(row=2, column=0, columnspan=4, sticky='w', padx=5, pady=(0, 2))
-
-        def _render_start():
-            """Draw the preview + set the labels for the ALREADY-captured pick, honouring the
-            Auto-snap checkbox. Split out from _capture_start so toggling the checkbox re-renders
-            (snap on -> 4 markers + green 'snapped' readout; off -> 1 marker + raw clr/bur, so the
-            toggle visibly changes the scene and the text). No-op until a pick has been captured."""
-            if start_point.get('raw_local') is None:
-                return
-            Console("OFF")
-            try:
-                pick_l = start_point['raw_local']
-                if caver_snap_var.get():
-                    s = _compute_snap(pick_l)
-                    snap_l = s['snapped']
-                    # CAVER frame = local with X negated (matches SavePDB(transform='No')).
-                    start_point['snap_caver'] = (-snap_l[0], snap_l[1], snap_l[2])
-                    start_point['snap_local'] = snap_l
-                    start_point['diag'] = s
-                    _draw_preview(pick_l, snap_l, s)
-                    status_lbl.config(
-                        text='snapped ✓   clr %.1f Å · bur %.0f%% · moved %.1f Å'
-                             % (s['clearance'], 100 * s['burial'], s['displacement']),
-                        foreground='#1a7f1a')
-                else:
-                    start_point.pop('snap_caver', None)
-                    atoms = _protein_atoms_local()
-                    clr = caver.point_clearance(pick_l, atoms)
-                    bur = caver.point_burial(pick_l, atoms, caver._sphere_directions(32))
-                    _draw_preview(pick_l, None, None)
-                    warn = '   ⚠ surface-exposed' if bur < 0.5 else ''
-                    status_lbl.config(
-                        text='raw click   clr %.1f Å · bur %.0f%%%s' % (clr, 100 * bur, warn),
-                        foreground=('#b06000' if warn else 'black'))
-            finally:
-                Console("hidden")
-
-        def _capture_start():
-            Console("OFF")
-            try:
-                # Clicking an atom in YASARA MARKS it (white firefly); MarkAtom() returns up to
-                # four marked atom numbers (0 = that slot unmarked). A click doesn't 'select',
-                # so read the pick from MarkAtom(), not ListAtom('Selected').
-                marked = [a for a in MarkAtom() if a]
-                if not marked:
-                    _caver_msg('Click an atom in YASARA to mark it (white firefly), then press '
-                               'this again.')
-                    return
-                sel = 'Atom ' + ' '.join(str(a) for a in marked)
-                # Work in the object's LOCAL frame (view-independent). CAVER frame = local with X
-                # negated -- the frame SavePDB(transform='No') writes, so start point and saved
-                # structure share one frame; global + transform='Yes' desync and find 0 tunnels.
-                lo = PosAtom(sel, coordsys='local'); k = len(marked)
-                pick_l = (sum(lo[0::3]) / k, sum(lo[1::3]) / k, sum(lo[2::3]) / k)
-                start_point['raw_local'] = pick_l
-                start_point['raw_caver'] = (-pick_l[0], pick_l[1], pick_l[2])
-                start_point.pop('snap_caver', None)
-            finally:
-                Console("hidden")
-            _render_start()
-
-        def _use_cog():
-            # No-click alternative: start from the target's centre of gravity (geometric centre
-            # of its non-water atoms), then let Auto-snap climb from there. On its own a protein's
-            # COG sits in the packed core and CAVER finds nothing -- but the snap can walk it into
-            # a nearby buried void, and the clearance/burial readout makes plain whether it landed
-            # somewhere usable, so it's an honest quick-start rather than a silent dead end.
-            Console("OFF")
-            try:
-                s = f'Obj {prot_obj} Res !HOH'
-                lo = PosAtom(s, coordsys='local', mean='Yes')
-                pick_l = (lo[0], lo[1], lo[2])
-                start_point['raw_local'] = pick_l
-                start_point['raw_caver'] = (-pick_l[0], pick_l[1], pick_l[2])
-                start_point.pop('snap_caver', None)
-            finally:
-                Console("hidden")
-            _render_start()
-
-        srcf = ttk.Frame(win)
-        srcf.grid(row=1, column=0, columnspan=4, sticky='w', padx=5, pady=2)
-        ttk.Label(srcf, text='Start point').pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(srcf, text='Marked atom', command=_capture_start).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(srcf, text='Center of gravity', command=_use_cog).pack(side=tk.LEFT)
-
-        # Auto-snap toggle + live clearance/burial readout ---------------------
-        caver_snap_var = tk.BooleanVar(value=True)
-        snap_help = ("On (recommended): the plugin nudges your click toward the\n"
-                     "roomiest nearby BURIED spot before running -- so you can mark\n"
-                     "an atom near the pocket instead of exactly inside it, and it\n"
-                     "won't drift onto the surface.\n"
-                     "   Magenta ball = your click\n"
-                     "   Yellow ball  = the snapped seed\n"
-                     "   Faint yellow = the open space found\n"
-                     "Off: your click is used as-is and CAVER's own start-point\n"
-                     "optimization ('Start-point search') is applied instead.")
-        snap_chk = ttk.Checkbutton(win, text='Auto-snap start into cavity',
-                                   variable=caver_snap_var, command=_render_start)
-        snap_chk.grid(row=3, column=0, columnspan=3, sticky='w', padx=5, pady=(4, 2))
-        snap_tip = ttk.Label(win, text='ⓘ', foreground='#3a6ea5', cursor='question_arrow')
-        snap_tip.grid(row=3, column=3, sticky='w', padx=5, pady=(4, 2))
-        create_tooltip(snap_tip, snap_help)
-        create_tooltip(snap_chk, snap_help)
-
-        # Parameters ----------------------------------------------------------
-        # Four short params in two columns; the longer "Start search" gets its own left-packed
-        # row so its width can't push the second column right.
-        params = [('Probe (Å)', 'probe', '0.9'),
-                  ('Shell R (Å)', 'shell_r', '3'),
-                  ('Shell depth', 'shell_d', '4'),
-                  ('Cluster thr', 'clust', '3.5')]
-        param_base = 4  # first parameter row (rows 1-3 are the start-point block)
+        params = [('Probe (Å)', 'probe'), ('Shell R (Å)', 'shell_r'),
+                  ('Shell depth', 'shell_d'), ('Cluster thr', 'clust'),
+                  ('Start search (Å)', 'max_dist')]
         pvars = {}
-        for i, (label, key, default) in enumerate(params):
-            r, c = param_base + i // 2, (i % 2) * 2   # two params per row
-            ttk.Label(win, text=label).grid(row=r, column=c, sticky='w', padx=(5, 2), pady=2)
-            v = tk.StringVar(value=default)
-            pvars[key] = v
-            ttk.Entry(win, textvariable=v, width=6).grid(row=r, column=c + 1, sticky='w',
-                                                         padx=(0, 6), pady=2)
+        for label, key in params:
+            ttk.Label(win, text=label).grid(row=r, column=0, sticky='w', padx=(5, 2), pady=2)
+            vv = tk.StringVar(value=str(caver_cfg[key]))
+            pvars[key] = vv
+            ttk.Entry(win, textvariable=vv, width=7).grid(row=r, column=1, sticky='w',
+                                                          padx=(0, 6), pady=2)
+            r += 1
 
-        ms_row = param_base + (len(params) + 1) // 2
-        msf = ttk.Frame(win)
-        msf.grid(row=ms_row, column=0, columnspan=4, sticky='w', padx=5, pady=2)
-        ttk.Label(msf, text='Start search (Å)').pack(side=tk.LEFT, padx=(0, 4))
-        max_dist_var = tk.StringVar(value='3'); pvars['max_dist'] = max_dist_var
-        ttk.Entry(msf, textvariable=max_dist_var, width=6).pack(side=tk.LEFT, padx=(0, 4))
-        ms_tip = ttk.Label(msf, text='ⓘ', foreground='#3a6ea5', cursor='question_arrow')
-        ms_tip.pack(side=tk.LEFT)
-        create_tooltip(ms_tip, "With Auto-snap ON: how far the plugin may move your click\n"
-                               "toward the roomiest nearby buried spot.\n"
-                               "With Auto-snap OFF: CAVER's own max_distance -- how far\n"
-                               "CAVER walks the start toward open space.\n"
-                               "Either way, raise it first if you get 0 tunnels; too large\n"
-                               "can drift into a neighbouring pocket.")
-
-        # Reuse the main dialog's "Exclude residues" selection: when ticked, whatever is
-        # highlighted there (a bound ligand, cofactors, ...) is deleted from CAVER's input
-        # in addition to water -- e.g. exclude the ligand you started on so tunnels pass
-        # through the vacated binding site.
-        caver_exclude_var = tk.BooleanVar(value=False)
-        excl_row = ms_row + 1
-        excl_chk = ttk.Checkbutton(win, text='Also exclude ticked residues',
-                                   variable=caver_exclude_var)
-        excl_chk.grid(row=excl_row, column=0, columnspan=4, sticky='w', padx=5, pady=(4, 2))
-        create_tooltip(excl_chk, 'Also drop the residues currently selected in the main dialog\'s\n'
-                                 '"Exclude residues" list from CAVER\'s input (e.g. the ligand you\n'
-                                 'started on, so tunnels pass through the vacated site).')
-
-        def _do_run():
+        def _ok():
             try:
-                probe = float(pvars['probe'].get())
-                shell_r = float(pvars['shell_r'].get())
-                shell_d = int(float(pvars['shell_d'].get()))
-                clust = float(pvars['clust'].get())
+                probe = float(pvars['probe'].get()); shell_r = float(pvars['shell_r'].get())
+                shell_d = int(float(pvars['shell_d'].get())); clust = float(pvars['clust'].get())
                 max_dist = float(pvars['max_dist'].get())
             except ValueError:
                 _caver_msg('Parameters must be numbers.')
                 return
             if max_dist < 0:
-                _caver_msg('Start-point search (Å) must be zero or positive.')
+                _caver_msg('Start search (Å) must be zero or positive.')
                 return
-            if start_point.get('raw_caver') is None:
-                _caver_msg('Mark an atom in YASARA near the cavity of interest (click it, white '
-                           'firefly), then press "Use marked atom". CAVER needs a start point '
-                           'inside a buried cavity -- the protein centre does not work.')
+            if not (v_tun.get() or v_mark.get() or v_cent.get()):
+                _caver_msg('Tick at least one seed source.')
                 return
-            # Resolve the start point at run time so the Auto-snap checkbox is authoritative:
-            #  snap ON  -> use the snapped seed (compute it now if the box was toggled on after
-            #              the last capture) and keep CAVER's own leash tight, since we already
-            #              did the moving; snap OFF -> raw pick + CAVER's max_distance = the field.
-            if caver_snap_var.get():
-                if 'snap_caver' not in start_point:
-                    s = _compute_snap(start_point['raw_local'])
-                    snap_l = s['snapped']
-                    start_point['snap_caver'] = (-snap_l[0], snap_l[1], snap_l[2])
-                xyz = start_point['snap_caver']
-                caver_md = min(max_dist, 1.0)
-            else:
-                xyz = start_point['raw_caver']
-                caver_md = max_dist
-            _clear_preview()  # markers would only clutter the imported tunnels
-            run_dir = tempfile.mkdtemp(prefix='tunneler_caver_')
-            in_dir = os.path.join(run_dir, 'input')
-            os.makedirs(in_dir)
-            out_dir = os.path.join(run_dir, 'out')
-            Console("OFF")
-            # Water fills cavities and blocks tunnels, so it must be excluded from CAVER's
-            # input. SavePDB writes whole OBJECTS (atom-subselections like 'Res !HOH' are
-            # ignored), so duplicate the structure, delete water from the copy, save that,
-            # and discard the copy. Non-water ligands/cofactors are kept (obstacles).
-            dup = DuplicateObj(prot_obj)[0]
-            DelRes(f'Obj {dup} Res HOH')
-            if caver_exclude_var.get():
-                # each Exclude-list item is 'RESNAME RESNUM' (e.g. 'NCA 603') -> a precise
-                # residue selection; delete them one by one from the copy.
-                for item in [listbox.get(idx) for idx in listbox.curselection()]:
-                    DelRes(f'Obj {dup} Res {item}')
-            # transform='No' writes the object's LOCAL frame (X-flipped for PDB), matching
-            # the local/X-negated start point above -- see _capture_start. Using the default
-            # (transform='Yes') bakes in the centering rotation and desyncs the two frames.
-            SavePDB(f'Obj {dup}', os.path.join(in_dir, 'structure.pdb'), transform='No')
-            DelObj(dup)
-            Console("hidden")
-            cfg_path = os.path.join(run_dir, 'config.txt')
-            with open(cfg_path, 'w') as f:
-                f.write(caver.make_config(xyz, probe_radius=probe, shell_radius=shell_r,
-                                          shell_depth=shell_d, clustering_threshold=clust,
-                                          max_distance=caver_md))
-            proc = caver.start_caver(caver.find_java(), home, in_dir, cfg_path, out_dir)
-            win.destroy()
-            _poll_caver(proc, out_dir, frame_obj=prot_obj)
-
-        def _cancel():
-            Console("OFF"); _clear_preview(); Console("hidden")
+            caver_cfg.update(probe=probe, shell_r=shell_r, shell_d=shell_d, clust=clust,
+                             max_dist=max_dist, snap=v_snap.get(), seed_tunnels=v_tun.get(),
+                             seed_marked=v_mark.get(), seed_centroid=v_cent.get(),
+                             seed_separate=v_sep.get())
             win.destroy()
 
-        win.protocol('WM_DELETE_WINDOW', _cancel)
-        btnf = ttk.Frame(win)
-        btnf.grid(row=excl_row + 1, column=0, columnspan=4, pady=(6, 8))
-        ttk.Button(btnf, text='Run', command=_do_run).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btnf, text='Cancel', command=_cancel).pack(side=tk.LEFT, padx=6)
+        ttk.Button(win, text='OK', command=_ok).grid(row=r, column=0, columnspan=2, pady=(8, 8))
 
-        # Unfold like a menu from the Load button: place the dialog's top-right corner at the
-        # button's bottom-right, so it drops down-and-left from the icon that opened it. Clamp
-        # x >= 0 so a narrow screen can't push it off the left edge.
+        # Unfold from the button that opened it (gear or Load): top-right corner at its
+        # bottom-right. Clamp x >= 0 so a narrow screen can't push it off the left edge.
         win.update_idletasks()
-        bx, by = load_button.winfo_rootx(), load_button.winfo_rooty()
-        bw, bh = load_button.winfo_width(), load_button.winfo_height()
+        anchor = anchor_widget or load_button
+        bx, by = anchor.winfo_rootx(), anchor.winfo_rooty()
+        bw, bh = anchor.winfo_width(), anchor.winfo_height()
         x = max(bx + bw - win.winfo_reqwidth(), 0)
         win.geometry(f'+{x}+{by + bh}')
 
@@ -2850,6 +3002,18 @@ def tunneler_dialog():
         # the new tunnel's axis by on_diameter's existence check (feeding old In/Out
         # positions into the slice).
         DelObj('???_axis ???_slice ???_xsec')
+        # CAVER overlay objects (caver / caver_sphere / per-seed caver_s#) aren't target-prefixed,
+        # so Tunneler's own cleanup misses them -- drop them here so a re-detection starts fresh
+        # (a stale overlay from the previous structure would otherwise linger). Hide the Caver tab
+        # too; it re-reveals if "Also run CAVER" produces a new overlay.
+        _cav_stale = [e.split(': ', 1)[0] for e in ListObj('all', format='OBJNUM: OBJNAME')
+                      if e.split(': ', 1)[1].startswith('caver')]
+        if _cav_stale:
+            DelObj('Obj ' + ' '.join(_cav_stale))
+            try:
+                notebook.tab(3, state='hidden')
+            except Exception:
+                pass
 
         Tunneler(target=re.findall(r"\d+(?=:)", target_option.get())[0], ignore_res=[listbox.get(i) for i in listbox.curselection()],
                  ignore_surface=ign_surf_scale_chk.get(), 
@@ -2883,6 +3047,14 @@ def tunneler_dialog():
             # "Improve performance" button did), so lightened rendering is on by default.
             if performant_mode_var.get():
                 _set_perf(True)
+        # "Also run CAVER" (tab-1 checkbox): seed CAVER from the tunnels just found and launch it
+        # in the background. mds>0 -> the MD frames become CAVER trajectory snapshots. Runs after
+        # the tabs/appearance are set up so the Tunneler result is already on screen.
+        if target() and caver_also_var.get():
+            # Debug (Wait) progress mode -> also insert the CAVER seed-eyeball breakpoint.
+            _run_caver_after_detection(re.findall(r"\d+(?=:)", target_option.get())[0],
+                                       mds=num_md_scale_chk.get(),
+                                       debug=(show_prog_var.get() == 'wait'))
         initializing = False
         Wait(1)
         Console("hidden")
@@ -2963,6 +3135,22 @@ def tunneler_dialog():
     run_tun_button = ttk.Button(tab1_mktun)
     run_tun_button.configure(style='Toolbutton', text='    Find tunnels    ', command=run_tun)
     run_tun_button.place(anchor="nw",  width=111,height=33, x=200, y=272)
+
+    # "Also run CAVER": after detection, run CAVER seeded from the tunnels just found (mds>0 ->
+    # the MD conformations become CAVER trajectory frames). The gear opens the full Run-CAVER
+    # dialog to tune params / pick a different start point; those choices persist into this run.
+    caver_also_var = tk.BooleanVar(value=False)
+    caver_also_chk = ttk.Checkbutton(tab1_mktun, text='CAVER', variable=caver_also_var)
+    caver_also_chk.place(anchor="nw", x=200, y=332)   # right column, below "Performant mode"
+    # Flat 'Toolbutton' style: the native ttk.Button chrome has large internal padding on macOS
+    # that clips a one-glyph label in a small box, so the gear was invisible; Toolbutton is flat.
+    # Custom derived style centres the glyph (default Toolbutton anchors the content west, and a
+    # fixed text width left-aligned it inside the placed box).
+    ttk.Style().configure('Gear.Toolbutton', anchor='center', padding=0)
+    caver_gear_btn = ttk.Button(tab1_mktun, text='⚙', style='Gear.Toolbutton',
+                                command=lambda: run_caver_dialog(anchor_widget=caver_gear_btn))
+    caver_gear_btn.place(anchor="nw", x=266, y=330, width=32, height=26)  # ends at x=298
+    # tooltips attached below, once create_tooltip() is defined (it is a later nested def).
 
     def reset():
         Console("OFF")
@@ -4014,6 +4202,14 @@ def tunneler_dialog():
         widget.bind('<Leave>', hide_tooltip)
 
 
+    create_tooltip(caver_gear_btn, 'CAVER settings: start point, probe / shell / clustering\n'
+                                   'params, residue excludes. Changes here are reused by\n'
+                                   '"Also run CAVER".')
+    create_tooltip(caver_also_chk, 'After detection, also run CAVER seeded from the tunnels\n'
+                                   'just found. With "Number of MD simulations" > 0, the MD\n'
+                                   'frames become a CAVER trajectory (each tunnel tracked\n'
+                                   'across the ensemble).')
+
     create_tooltip(performant_mode_chk, "Performant mode: trades resolution for interaction speed. Coarser\n"
                                   "detection grid allowed (the Ball-spacing slider shifts to a larger\n"
                                   "range), a coarser display surface, and the render performance cull is\n"
@@ -4212,7 +4408,7 @@ def tunneler_dialog():
     load_menu = tk.Menu(root, tearoff=0)
     load_menu.add_command(label='Tunneler scene…', command=load_tunneler_scene)
     load_menu.add_separator()
-    load_menu.add_command(label='Run CAVER…', command=run_caver_dialog)
+    load_menu.add_command(label='CAVER settings…', command=run_caver_dialog)
     load_menu.add_command(label='Import CAVER output…', command=import_caver)
 
     # Compact icon buttons (folder = Load, floppy = Save) so the row fits beside the
@@ -5426,7 +5622,8 @@ def tunneler_dialog():
     caver_palette_var = tk.StringVar(value='Rainbow')
     caver_colorby_var = tk.StringVar(value='Cluster')
     caver_shape_var   = tk.StringVar(value='Spheres')
-    caver_alpha_var   = tk.IntVar(value=100)
+    caver_alpha_var   = tk.IntVar(value=50)
+    caver_dedup_var   = tk.BooleanVar(value=True)    # point-wise merge into one overlap-free network
 
     def _reveal_caver_tab(select=True):
         """Un-hide the Caver tab (hidden until a CAVER overlay exists), optionally show it."""
@@ -5455,32 +5652,55 @@ def tunneler_dialog():
         color_by = caver_colorby_var.get()
         alpha = float(caver_alpha_var.get())
         shape = caver_shape_var.get()
+        no_color = (palette == 'No color')   # all tunnels white; Color-by is inert
+        try:                                 # grey out Color-by when there's nothing to colour by
+            caver_colorby_menu.configure(state='disabled' if no_color else 'normal')
+        except Exception:
+            pass
 
         mols = ListMol(f'Obj {cav}', format='MOLNAME')   # ['tA','tB',...] one per cluster
         bf_all = BFactorAtom(f'Obj {cav}')
         lo, hi = (min(bf_all), max(bf_all)) if bf_all else (0.0, 1.0)
         centers, radii, colors = [], [], []
         n = len(mols)
+        # Point-wise dedup (checkbox): draw the tunnels in order; a bead is skipped if it lies
+        # within `dedup_cut` of a bead already committed from a PRIOR tunnel (never from its own
+        # tunnel, so each tunnel keeps its full resolution). The result is one overlap-free
+        # network that still traces every distinct path. `committed` grows per tunnel.
+        dedup = caver_dedup_var.get()
+        dedup_cut = 1.5
+        committed_pts, committed = [], None
         for i, m in enumerate(mols):
             pos = PosAtom(f'Obj {cav} Mol {m}', coordsys='global')   # global: matches the scene
             bf = BFactorAtom(f'Obj {cav} Mol {m}')
-            clustcol = _palette_color(palette, i / max(n - 1, 1))
+            clustcol = None if no_color else _palette_color(palette, i / max(n - 1, 1))
+            mol_kept = []
             for j in range(len(bf)):
-                centers.append((pos[3 * j], pos[3 * j + 1], pos[3 * j + 2]))
+                c = (pos[3 * j], pos[3 * j + 1], pos[3 * j + 2])
+                if dedup and committed is not None and committed.query(c)[0] <= dedup_cut:
+                    continue                        # already drawn by an earlier tunnel
+                centers.append(c)
                 radii.append(bf[j])
-                if color_by == 'Radius':
+                if no_color:
+                    colors.append('ffffff')         # single flat white
+                elif color_by == 'Radius':
                     u = (bf[j] - lo) / (hi - lo) if hi > lo else 0.5
                     colors.append(_palette_color(palette, u))
                 else:
                     colors.append(clustcol)
+                mol_kept.append(c)
+            if dedup and mol_kept:                  # commit this tunnel's points for later tunnels
+                committed_pts.extend(mol_kept)
+                committed = cKDTree(committed_pts)
         if not centers:
             Console("hidden"); return
 
-        if shape == 'Surface':
-            # One merged smooth surface (marching-cubes union of balls). The builder takes a
-            # single radius, so use the median bead radius (uniform width); the Spheres mode
-            # still shows the true per-bead variation.
-            obj = _union_shape_mesh(centers, colors, float(np.median(radii)), alpha)
+        if shape.startswith('Surface'):
+            # One merged smooth surface (marching-cubes union of balls). 'uniform' uses the median
+            # bead radius (constant-width sausage); 'thickness' feeds the per-bead radii so the
+            # surface bulges at wide points and pinches at bottlenecks.
+            rad = np.asarray(radii, float) if 'thickness' in shape else float(np.median(radii))
+            obj = _union_shape_mesh(centers, colors, rad, alpha)
             if obj is not None:
                 NameObj(obj, 'caver_sphere')
         else:
@@ -5497,22 +5717,30 @@ def tunneler_dialog():
               font='TkSmallCaptionFont').grid(row=0, column=0, columnspan=2, sticky='w',
                                               padx=10, pady=(10, 4))
     ttk.Label(tab4_caver, text='Palette').grid(row=1, column=0, sticky='w', padx=10, pady=7)
+    # 'No color' = flat white, ignores Color-by (which is then greyed out in _redraw_caver).
     ttk.OptionMenu(tab4_caver, caver_palette_var, caver_palette_var.get(),
-                   *DIST_PALETTES.keys(), command=_redraw_caver).grid(
+                   'No color', *DIST_PALETTES.keys(), command=_redraw_caver).grid(
         row=1, column=1, sticky='w', padx=10, pady=7)
     ttk.Label(tab4_caver, text='Color by').grid(row=2, column=0, sticky='w', padx=10, pady=7)
-    ttk.OptionMenu(tab4_caver, caver_colorby_var, caver_colorby_var.get(),
-                   'Cluster', 'Radius', command=_redraw_caver).grid(
-        row=2, column=1, sticky='w', padx=10, pady=7)
+    caver_colorby_menu = ttk.OptionMenu(tab4_caver, caver_colorby_var, caver_colorby_var.get(),
+                                        'Cluster', 'Radius', command=_redraw_caver)
+    caver_colorby_menu.grid(row=2, column=1, sticky='w', padx=10, pady=7)
     ttk.Label(tab4_caver, text='Shape').grid(row=3, column=0, sticky='w', padx=10, pady=7)
     ttk.OptionMenu(tab4_caver, caver_shape_var, caver_shape_var.get(),
-                   'Spheres', 'Surface', command=_redraw_caver).grid(
+                   'Spheres', 'Surface (uniform)', 'Surface (thickness)', command=_redraw_caver).grid(
         row=3, column=1, sticky='w', padx=10, pady=7)
     ttk.Label(tab4_caver, text='Alpha').grid(row=4, column=0, sticky='w', padx=10, pady=7)
     caver_alpha_scale = ttk.Scale(tab4_caver, from_=5, to=100, orient='horizontal',
                                   variable=caver_alpha_var, length=150)
     caver_alpha_scale.grid(row=4, column=1, sticky='w', padx=10, pady=7)
     caver_alpha_scale.bind('<ButtonRelease-1>', _redraw_caver)   # redraw on release, not each pixel
+    caver_dedup_chk = ttk.Checkbutton(tab4_caver, text='Merge into one network (dedup overlap)',
+                                      variable=caver_dedup_var, command=_redraw_caver)
+    caver_dedup_chk.grid(row=5, column=0, columnspan=2, sticky='w', padx=10, pady=7)
+    create_tooltip(caver_dedup_chk,
+                   'Draw the tunnels in order and skip any bead within ~1.5 Å of a bead already\n'
+                   'drawn by an earlier tunnel. Overlapping stretches are drawn once, so you get a\n'
+                   'single overlap-free network that still traces every distinct path.')
 
     # --------------------------------------------------------
     #  DIALOG MAINLOOP
