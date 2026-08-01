@@ -995,8 +995,9 @@ def tunneler_dialog():
         radio_col_var.set('tunnel')
         button18.configure(text='select')
         _bump(93, 'computing distances')
-        # Recluster changed the cluster set -> refresh the slider's precomputed distances.
-        _precompute_surf_dist(tar)
+        # Recluster changed the cluster set -> rebuild R* and re-apply the current trim.
+        _precompute_hull_radius(tar)
+        _apply_hull_trim(tar, surf_pts_chk.get())
         _bump(100, 'done')
         try:
             progress_window.destroy()
@@ -3040,13 +3041,16 @@ def tunneler_dialog():
             for x in ListObj(f'{target()}Cl???????', format='OBJNUM: OBJNAME'):
                 tnl_insp_options_list.append(x)
             update_option_menu(tab3_inspect, tnl_insp_option, tnl_insp_options_list, current_value='All')
-            # Precompute surface-point distances now (cheap KDTree) so the
-            # Surface-points slider in the Appearance tab is instant from the first drag.
-            _precompute_surf_dist(target())
+            # Precompute the concave-hull critical radius R* into the Property field so the
+            # Surface-points knob in the Appearance tab is instant from the first drag.
+            _precompute_hull_radius(target())
             # Performant mode: auto-apply the render performance cull (what the old
             # "Improve performance" button did), so lightened rendering is on by default.
             if performant_mode_var.get():
                 _set_perf(True)
+            # Auto-trim the exposed exterior at the default probe radius (additive, so it
+            # composes with any perf-mode interior hiding just applied).
+            _apply_hull_trim(target(), surf_pts_chk.get())
         # "Also run CAVER" (tab-1 checkbox): seed CAVER from the tunnels just found and launch it
         # in the background. mds>0 -> the MD frames become CAVER trajectory snapshots. Runs after
         # the tabs/appearance are set up so the Tunneler result is already on screen.
@@ -3606,73 +3610,102 @@ def tunneler_dialog():
     shape_alpha_chk.set(80)
 
 
-    # target -> (n_cluster_atoms, min_dist, max_dist). The per-atom distance itself
-    # lives in each cluster atom's Property field. Cached so the precompute runs
-    # once per cluster set. Cheap enough (KDTree) to run eagerly at the end of
-    # detection/recluster (see _precompute_surf_dist calls) so the slider is instant
-    # from the very first drag.
-    surf_dist_cache = {}
+    # Concave-hull tunnel trimming (the "Surface points" control -- now a rolling-ball
+    # probe-radius knob). Each cluster atom stores, in its Property field, its CRITICAL
+    # RADIUS R*: the smallest rolling-ball probe radius for which the point falls INSIDE
+    # the protein's concave hull (the solvent-excluded surface at that probe size). A
+    # point is kept at knob radius R iff R* <= R, so the slider is a pure 'hide
+    # Property>R' with no per-move recompute. Big R keeps almost everything (only genuine
+    # free solvent, R*=RINF, drops out); small R aggressively trims open grooves. This
+    # replaces the old distance-to-surface metric, which ordered points by distance to the
+    # nearest wall (interior walls included) rather than depth-from-the-outside, so it hid
+    # the wrong points. Cached per cluster set (keyed by atom count); ~1s to build.
+    HULL_RMIN, HULL_RMAX, HULL_RSTEP = 2.5, 8.0, 0.5
+    HULL_GRID_H, HULL_ATOM_R = 0.75, 1.7
+    HULL_DEFAULT_R = 5.0
+    HULL_RINF = 999.0     # R* sentinel for points never enclosed even at HULL_RMAX
+    hull_cache = {}
 
-    def _precompute_surf_dist(tar):
-        """Precompute each cluster atom's distance to the roughsurf point cloud
-        (KDTree, global coords) and store it bucketed in the atom Property field, so
-        the Surface-points slider becomes a pure 'Property<threshold' hide with no
-        per-move surface recompute. No-op if already done for the current cluster
-        set. Does not change what is visible; only populates the Property field."""
+    def _precompute_hull_radius(tar):
+        """Populate each cluster atom's Property field with its critical probe radius R*
+        (see the block comment above). Method: rasterize the protein to an occupancy grid,
+        then sweep the probe radius R and, at each R, compute the rolling-ball closing
+        (grow the protein by R, shrink back by R) via two Euclidean distance transforms;
+        a tunnel point's R* is the first R at which it lands inside the closed volume.
+        ~1s once per cluster set; no-op if already done for the current atom count. Reads
+        protein + cluster positions in one consistent global snapshot; R* is a radius, so
+        it is frame-independent once stored. Does not change visibility."""
         n_cl = CountAtom(f'obj {tar}Cl???????')
-        cache = surf_dist_cache.get(tar)
-        if n_cl == 0 or (cache is not None and cache[0] == n_cl):
+        if n_cl == 0 or hull_cache.get(tar) == n_cl:
             return
+        from scipy.ndimage import distance_transform_edt
         Console("OFF")
-        SupAtom(f'obj {tar}roughsurf', f'obj {tar}', match='Yes')
-        rs_du = DuplicateObj(f'{tar}roughsurf')[0]
-        DelAtom(f'obj {rs_du} element !Du')
-        rs_pos = np.array(PosAtom(f'obj {rs_du} element Du', coordsys='global')).reshape(-1, 3)
-        DelObj(rs_du)
-        cl = np.array(ListAtom(f'obj {tar}Cl???????'))
+        cl_atoms = np.array(ListAtom(f'obj {tar}Cl???????'))
         cl_pos = np.array(PosAtom(f'obj {tar}Cl???????', coordsys='global')).reshape(-1, 3)
-        if len(cl) == 0 or len(rs_pos) == 0:
+        pa = np.array(PosAtom(f'obj {tar} Res !HOH', coordsys='global')).reshape(-1, 3)
+        if len(cl_atoms) == 0 or len(pa) == 0:
             return
-        dist = cKDTree(rs_pos).query(cl_pos)[0]
-        # Store distance (bucketed to 0.1 A) per atom: one grouped PropAtom per
-        # bucket (~200 calls, independent of atom count; PropAtom takes a single
-        # value, so a per-atom list can't be set at once).
-        PropAtom(f'obj {tar}Cl???????', 99999)
-        dr = np.round(dist, 1)
-        for v in np.unique(dr):
-            PropAtom('atom ' + ' '.join(map(str, cl[dr == v])), float(v))
-        surf_dist_cache[tar] = (n_cl, float(dist.min()), float(dist.max()))
+        h = HULL_GRID_H
+        pad = HULL_RMAX + 3 * h
+        lo = np.minimum(pa.min(0), cl_pos.min(0)) - pad
+        hi = np.maximum(pa.max(0), cl_pos.max(0)) + pad
+        dims = np.ceil((hi - lo) / h).astype(int) + 1
+        seed = np.ones(dims, dtype=bool)
+        ijk = np.floor((pa - lo) / h).astype(int)
+        seed[ijk[:, 0], ijk[:, 1], ijk[:, 2]] = False
+        occ = (distance_transform_edt(seed) * h) < HULL_ATOM_R    # protein volume
+        edt_out = distance_transform_edt(~occ) * h                # dist-to-protein (once)
+        v = np.floor((cl_pos - lo) / h).astype(int)
+        rstar = np.full(len(cl_atoms), HULL_RINF)
+        R = HULL_RMIN
+        while R <= HULL_RMAX + 1e-6:
+            dilated = edt_out <= R                                  # grow protein by R
+            closed = (distance_transform_edt(dilated) * h) >= R     # shrink back by R
+            keep = closed[v[:, 0], v[:, 1], v[:, 2]]
+            newly = keep & (rstar > HULL_RMAX)
+            rstar[newly] = R
+            R += HULL_RSTEP
+        # store R* (already on the R grid) via one grouped PropAtom per bucket
+        PropAtom(f'obj {tar}Cl???????', HULL_RINF)
+        for val in np.unique(rstar):
+            sel = cl_atoms[rstar == val]
+            PropAtom('atom ' + ' '.join(map(str, sel)), float(val))
+        hull_cache[tar] = n_cl
+
+    def _apply_hull_trim(tar, r):
+        """Hide tunnel points outside the concave hull at knob radius r (Property>r).
+        ADDITIVE: it does not ShowAtom first, so it composes on top of any performance-mode
+        interior hiding already applied. At the max knob everything is revealed (including
+        genuine free solvent). Used for the auto-trim at detection/recluster."""
+        if r >= HULL_RMAX - 1e-6:
+            ShowAtom(f'obj {tar}Cl???????')
+        else:
+            HideAtom(f'obj {tar}Cl??????? and Property>{r:.3f}')
 
     def ml_outside_points(by=25.5):
-        """Hide tunnel points near the protein surface (the 'Surface points' slider callback).
-
-        Distances are precomputed into the atom Property field (see
-        _precompute_surf_dist, run eagerly after detection/recluster), so moving the
-        slider is just a fast 'Property<threshold' hide. Falls back to precomputing
-        on demand if it has not run yet for this cluster set.
-        """
+        """'Surface points' slider callback -- a rolling-ball probe-radius knob. surf_pts_chk
+        holds the probe radius R; points whose critical radius R* > R (outside the concave
+        hull at this probe size) are hidden. R* is precomputed into the Property field (see
+        _precompute_hull_radius), so moving the slider is an instant 'Property>R' hide."""
         Console("OFF")
         tar = target()
         # Neither the sphere meshes nor the MergeSph/VdW shapes can be partially hidden
-        # (they are monolithic LoadWOb/surface meshes, not per-atom), so a surface-points
-        # change can't update them live -- drop to the native, per-atom-hideable ball rep.
-        # Balls() reads which sphere/shape objects are currently *on* to know which tunnels
-        # to show, so it must run BEFORE those meshes get switched off (it turns them off
-        # itself). Doing a blanket SwitchObj('...','OFF') first would hide the shapes and
-        # leave nothing visible -- which was the Shape-mode bug.
+        # (they are monolithic LoadWOb/surface meshes, not per-atom), so a trim can't update
+        # them live -- drop to the native, per-atom-hideable ball rep. Balls() reads which
+        # sphere/shape objects are currently *on* to know which tunnels to show, so it must
+        # run BEFORE those meshes get switched off (it turns them off itself).
         if radio_var.get() in ('spheres', 'shape'):
             radio_var.set('balls')
             Balls()
         else:
             SwitchObj('???_Sphere ???_shape', 'OFF')
-        _precompute_surf_dist(tar)
-        cache = surf_dist_cache.get(tar)
-        if cache is None:
+        _precompute_hull_radius(tar)
+        if hull_cache.get(tar) is None:
             Wait(1); Console("hidden"); return
-        _, min_dist, max_dist = cache
-        cur_dist = min_dist + (max_dist - min_dist) * surf_pts_chk.get()
+        r = surf_pts_chk.get()
         ShowAtom(f'obj {tar}Cl???????')
-        HideAtom(f'obj {tar}Cl??????? and Property<{cur_dist:.3f}')
+        if r < HULL_RMAX - 1e-6:
+            HideAtom(f'obj {tar}Cl??????? and Property>{r:.3f}')
         Wait(1)
         Console("hidden")
 
@@ -4298,8 +4331,10 @@ def tunneler_dialog():
         text='None')
     label12.place(anchor="nw", x=274, y=247)
   
-    surf_pts_chk = tk.DoubleVar()  # Variable to track the checkbox status
-    scale1 = ttk.Scale(tab2_appear)
+    # Rolling-ball probe-radius knob: left (from_=RMAX) keeps almost everything, right
+    # (to=RMIN) aggressively trims open grooves. Default sits at the sensible mid probe.
+    surf_pts_chk = tk.DoubleVar(value=HULL_DEFAULT_R)
+    scale1 = ttk.Scale(tab2_appear, from_=HULL_RMAX, to=HULL_RMIN)
     scale1.configure(orient="horizontal", state="normal", variable=surf_pts_chk, command=ml_outside_points)
     scale1.place(
         anchor="nw",
